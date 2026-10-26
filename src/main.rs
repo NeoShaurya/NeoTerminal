@@ -68,18 +68,26 @@ fn clean_terminal_output(raw: &str, leftover: &mut String) -> String {
                     *leftover = String::from_utf8_lossy(&bytes[i..]).to_string();
                     break;
                 }
+            } else if next == b'(' || next == b')' || next == b'*' || next == b'+' {
+                if i + 2 < len {
+                    i += 3;
+                } else {
+                    *leftover = String::from_utf8_lossy(&bytes[i..]).to_string();
+                    break;
+                }
             } else {
                 i += 2;
             }
         } else if b == b'\r' {
-            if i + 1 < len && bytes[i + 1] == b'\n' {
+            if i + 1 >= len {
+                *leftover = "\r".to_string();
+                break;
+            }
+            if bytes[i + 1] == b'\n' {
                 i += 1;
             } else {
-                while let Some(last) = out.chars().last() {
-                    if last == '\n' {
-                        break;
-                    }
-                    out.pop();
+                if !out.ends_with('\n') {
+                    out.push('\n');
                 }
                 i += 1;
             }
@@ -180,6 +188,8 @@ struct NeoTerminalApp {
     history_idx: Option<usize>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     rx: Receiver<String>,
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+    _child: Box<dyn portable_pty::Child + Send + Sync>,
 }
 
 impl NeoTerminalApp {
@@ -197,10 +207,41 @@ impl NeoTerminalApp {
         #[cfg(target_os = "windows")]
         let cmd = {
             let mut c = CommandBuilder::new("powershell.exe");
-            c.args(["-NoLogo"]);
+            c.args([
+                "-NoLogo",
+                "-NoExit",
+                "-Command",
+                "Remove-Module PSReadLine -ErrorAction SilentlyContinue",
+            ]);
+            let mut current_path = String::new();
             for (k, v) in std::env::vars_os() {
-                c.env(k, v);
+                if k.to_string_lossy().eq_ignore_ascii_case("PATH") {
+                    current_path = v.to_string_lossy().to_string();
+                } else {
+                    c.env(k, v);
+                }
             }
+            // Ensure APPDATA\npm and USERPROFILE\.cargo\bin are in PATH so scraper tools and cargo are always reachable
+            if let Ok(appdata) = std::env::var("APPDATA") {
+                let npm_dir = format!("{}\\npm", appdata);
+                if !current_path.to_lowercase().contains(&npm_dir.to_lowercase()) {
+                    if !current_path.is_empty() && !current_path.ends_with(';') {
+                        current_path.push(';');
+                    }
+                    current_path.push_str(&npm_dir);
+                }
+            }
+            if let Ok(userprofile) = std::env::var("USERPROFILE") {
+                let cargo_dir = format!("{}\\.cargo\\bin", userprofile);
+                if !current_path.to_lowercase().contains(&cargo_dir.to_lowercase()) {
+                    if !current_path.is_empty() && !current_path.ends_with(';') {
+                        current_path.push(';');
+                    }
+                    current_path.push_str(&cargo_dir);
+                }
+            }
+            c.env("PATH", current_path);
+
             if let Ok(home) = std::env::var("USERPROFILE") {
                 c.cwd(home);
             }
@@ -217,19 +258,19 @@ impl NeoTerminalApp {
             c
         };
 
-        let _child = pair.slave.spawn_command(cmd)?;
-        drop(pair.slave);
-
         let mut reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
         let writer = Arc::new(Mutex::new(writer));
+
+        let child = pair.slave.spawn_command(cmd)?;
+        drop(pair.slave);
 
         // Background thread using std::sync::mpsc to read shell output and send it to the GUI
         let (tx, rx) = channel::<String>();
         let egui_ctx = cc.egui_ctx.clone();
 
         std::thread::spawn(move || {
-            let mut buf = [0u8; 2048];
+            let mut buf = [0u8; 4096];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break, // Shell exited / EOF
@@ -255,6 +296,8 @@ impl NeoTerminalApp {
             history_idx: None,
             writer,
             rx,
+            _master: pair.master,
+            _child: child,
         };
 
         app.apply_theme(&cc.egui_ctx);
@@ -319,7 +362,8 @@ impl NeoTerminalApp {
 
         // Send normal command to shell thread using Carriage Return \r for interactive execution
         if let Ok(mut w) = self.writer.lock() {
-            let _ = w.write_all(format!("{}\r", cmd).as_bytes());
+            let payload = format!("{}\r", trimmed);
+            let _ = w.write_all(payload.as_bytes());
             let _ = w.flush();
         }
     }
@@ -332,10 +376,16 @@ impl eframe::App for NeoTerminalApp {
             let cleaned = clean_terminal_output(&msg, &mut self.ansi_leftover);
             self.terminal_output.push_str(&cleaned);
 
-            // Cap output to prevent unbounded memory growth
+            // Cap output to prevent unbounded memory growth (UTF-8 character boundary safe)
             if self.terminal_output.len() > 100_000 {
                 let excess = self.terminal_output.len() - 100_000;
-                self.terminal_output.drain(..excess);
+                if let Some((idx, _)) = self
+                    .terminal_output
+                    .char_indices()
+                    .find(|(idx, _)| *idx >= excess)
+                {
+                    self.terminal_output.drain(..idx);
+                }
             }
         }
 
@@ -617,6 +667,10 @@ impl eframe::App for NeoTerminalApp {
 }
 
 fn main() -> eframe::Result {
+    std::panic::set_hook(Box::new(|info| {
+        let _ = std::fs::write("C:\\Users\\shaur\\neo_panic.log", format!("PANIC: {:?}", info));
+    }));
+
     // Suppress system modal error boxes
     #[cfg(target_os = "windows")]
     unsafe {
@@ -638,8 +692,201 @@ fn main() -> eframe::Result {
         "NeoTerminal",
         options,
         Box::new(|cc| {
-            let app = NeoTerminalApp::new(cc).expect("Failed to initialize NeoTerminal backend");
+            let app = match NeoTerminalApp::new(cc) {
+                Ok(a) => a,
+                Err(e) => {
+                    let _ = std::fs::write("C:\\Users\\shaur\\neo_panic.log", format!("INIT ERROR: {:?}", e));
+                    panic!("Init error: {:?}", e);
+                }
+            };
             Ok(Box::new(app))
         }),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_clean_terminal_output_ansi_csi() {
+        let mut leftover = String::new();
+        let raw = "\x1b[32mHello \x1b[1;34mWorld\x1b[0m\r\n";
+        let cleaned = clean_terminal_output(raw, &mut leftover);
+        assert_eq!(cleaned, "Hello World\n");
+        assert!(leftover.is_empty());
+    }
+
+    #[test]
+    fn test_clean_terminal_output_osc() {
+        let mut leftover = String::new();
+        let raw = "\x1b]0;Title\x07Text\r\n";
+        let cleaned = clean_terminal_output(raw, &mut leftover);
+        assert_eq!(cleaned, "Text\n");
+        assert!(leftover.is_empty());
+    }
+
+    #[test]
+    fn test_clean_terminal_output_crlf_split() {
+        let mut leftover = String::new();
+        let chunk1 = "[OpenClaw Sync] Scraping repositories...\r";
+        let cleaned1 = clean_terminal_output(chunk1, &mut leftover);
+        assert_eq!(cleaned1, "[OpenClaw Sync] Scraping repositories...");
+        assert_eq!(leftover, "\r");
+
+        let chunk2 = "\n[OpenClaw Sync] Found 3 repositories\r\n";
+        let cleaned2 = clean_terminal_output(chunk2, &mut leftover);
+        assert_eq!(cleaned2, "\n[OpenClaw Sync] Found 3 repositories\n");
+        assert!(leftover.is_empty());
+    }
+
+    #[test]
+    fn test_clean_terminal_output_bare_cr_progress() {
+        let mut leftover = String::new();
+        let raw = "Step 1\rStep 2\r\n";
+        let cleaned = clean_terminal_output(raw, &mut leftover);
+        assert_eq!(cleaned, "Step 1\nStep 2\n");
+        assert!(leftover.is_empty());
+    }
+
+    #[test]
+    fn test_clean_terminal_output_backspace() {
+        let mut leftover = String::new();
+        let raw = "abc\x08d";
+        let cleaned = clean_terminal_output(raw, &mut leftover);
+        assert_eq!(cleaned, "abd");
+    }
+
+    #[test]
+    fn test_clean_terminal_output_split_escape() {
+        let mut leftover = String::new();
+        let chunk1 = "Hello \x1b[";
+        let cleaned1 = clean_terminal_output(chunk1, &mut leftover);
+        assert_eq!(cleaned1, "Hello ");
+        assert_eq!(leftover, "\x1b[");
+
+        let chunk2 = "32mWorld";
+        let cleaned2 = clean_terminal_output(chunk2, &mut leftover);
+        assert_eq!(cleaned2, "World");
+        assert!(leftover.is_empty());
+    }
+
+    #[test]
+    fn test_clean_terminal_output_utf8() {
+        let mut leftover = String::new();
+        let raw = "Status: █ SYSTEM ONLINE — OK\r\n";
+        let cleaned = clean_terminal_output(raw, &mut leftover);
+        assert_eq!(cleaned, "Status: █ SYSTEM ONLINE — OK\n");
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn test_backend_sync_projects_pty() {
+        use std::time::{Duration, Instant};
+
+        let pty_system = NativePtySystem::default();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 32,
+                cols: 120,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty failed");
+
+        let mut cmd = CommandBuilder::new("powershell.exe");
+        cmd.args([
+            "-NoLogo",
+            "-NoExit",
+            "-Command",
+            "Remove-Module PSReadLine -ErrorAction SilentlyContinue",
+        ]);
+
+        let mut current_path = String::new();
+        for (k, v) in std::env::vars_os() {
+            if k.to_string_lossy().eq_ignore_ascii_case("PATH") {
+                current_path = v.to_string_lossy().to_string();
+            } else {
+                cmd.env(k, v);
+            }
+        }
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let npm_dir = format!("{}\\npm", appdata);
+            if !current_path.to_lowercase().contains(&npm_dir.to_lowercase()) {
+                if !current_path.is_empty() && !current_path.ends_with(';') {
+                    current_path.push(';');
+                }
+                current_path.push_str(&npm_dir);
+            }
+        }
+        if let Ok(userprofile) = std::env::var("USERPROFILE") {
+            let cargo_dir = format!("{}\\.cargo\\bin", userprofile);
+            if !current_path.to_lowercase().contains(&cargo_dir.to_lowercase()) {
+                if !current_path.is_empty() && !current_path.ends_with(';') {
+                    current_path.push(';');
+                }
+                current_path.push_str(&cargo_dir);
+            }
+        }
+        cmd.env("PATH", current_path);
+
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            cmd.cwd(home);
+        }
+
+        let mut reader = pair.master.try_clone_reader().expect("reader clone failed");
+        let mut writer = pair.master.take_writer().expect("take_writer failed");
+        let _child = pair.slave.spawn_command(cmd).expect("spawn_command failed");
+        drop(pair.slave);
+
+        // Keep master alive
+        let _master = pair.master;
+
+        // Allow PowerShell to initialize
+        std::thread::sleep(Duration::from_millis(1500));
+
+        // Read initial prompt
+        let mut buf = [0u8; 4096];
+        let _ = reader.read(&mut buf);
+
+        // Send sync-projects
+        writer
+            .write_all(b"sync-projects\r")
+            .expect("write failed");
+        writer.flush().expect("flush failed");
+
+        let mut accumulated = String::new();
+        let mut leftover = String::new();
+        let start = Instant::now();
+
+        // Read until we see sync completion or timeout
+        while start.elapsed() < Duration::from_secs(15) {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let cleaned = clean_terminal_output(&chunk, &mut leftover);
+                    accumulated.push_str(&cleaned);
+                    if accumulated.contains("[OpenClaw Sync]")
+                        && (accumulated.contains("All projects already up to date")
+                            || accumulated.contains("Sync pipeline completed"))
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        println!("Test Accumulated Output:\n{}", accumulated);
+        assert!(
+            accumulated.contains("[OpenClaw Sync]"),
+            "Output must contain OpenClaw Sync header"
+        );
+        assert!(
+            accumulated.contains("Starting GitHub -> Portfolio Sync Pipeline"),
+            "Output must show sync pipeline start"
+        );
+    }
+}
+
