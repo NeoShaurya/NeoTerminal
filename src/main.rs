@@ -194,6 +194,26 @@ struct NeoTerminalApp {
 
 impl NeoTerminalApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Result<Self, Box<dyn std::error::Error>> {
+        // Load bold native monospace font for punchy Neo-Brutalist typography
+        let mut fonts = egui::FontDefinitions::default();
+        if let Ok(font_bytes) = std::fs::read("C:\\Windows\\Fonts\\consolab.ttf") {
+            fonts.font_data.insert(
+                "consolas_bold".to_owned(),
+                egui::FontData::from_owned(font_bytes),
+            );
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .insert(0, "consolas_bold".to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "consolas_bold".to_owned());
+        }
+        cc.egui_ctx.set_fonts(fonts);
+
         // Backend: Use portable-pty to spawn the default system shell
         let pty_system = NativePtySystem::default();
         let pair = pty_system.openpty(PtySize {
@@ -548,13 +568,14 @@ impl eframe::App for NeoTerminalApp {
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new("NEOTERMINAL")
-                            .font(FontId::monospace(18.0))
+                            .font(FontId::monospace(19.0))
                             .strong()
                             .color(fg_color),
                     );
                     ui.label(
                         RichText::new("// POWERSHELL CONPTY")
-                            .font(FontId::monospace(12.0))
+                            .font(FontId::monospace(13.0))
+                            .strong()
                             .color(fg_color),
                     );
 
@@ -610,7 +631,8 @@ impl eframe::App for NeoTerminalApp {
                         ui.add(
                             egui::Label::new(
                                 RichText::new(&self.terminal_output)
-                                    .font(FontId::monospace(14.0))
+                                    .font(FontId::monospace(15.0))
+                                    .strong()
                                     .color(fg_color),
                             )
                             .wrap_mode(egui::TextWrapMode::Wrap),
@@ -636,7 +658,7 @@ impl eframe::App for NeoTerminalApp {
                         ui.horizontal(|ui| {
                             ui.label(
                                 RichText::new("PS >")
-                                    .font(FontId::monospace(15.0))
+                                    .font(FontId::monospace(15.5))
                                     .strong()
                                     .color(fg_color),
                             );
@@ -656,7 +678,7 @@ impl eframe::App for NeoTerminalApp {
 
                             ui.label(
                                 RichText::new(input_line)
-                                    .font(FontId::monospace(15.0))
+                                    .font(FontId::monospace(15.5))
                                     .strong()
                                     .color(fg_color),
                             );
