@@ -15,48 +15,90 @@ extern "system" {
     fn SetErrorMode(uMode: u32) -> u32;
 }
 
-/// Filter ANSI escape sequences and normalize control characters
-fn clean_terminal_output(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut chars = raw.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            if let Some(&next) = chars.peek() {
-                if next == '[' {
-                    chars.next();
-                    // consume parameter and intermediate bytes until terminating char
-                    while let Some(&b) = chars.peek() {
-                        chars.next();
-                        if ('@'..='~').contains(&b) {
-                            break;
-                        }
-                    }
-                    continue;
-                } else if next == ']' {
-                    // OSC sequence: consume until BEL (\x07) or ST (\x1b\)
-                    chars.next();
-                    while let Some(b) = chars.next() {
-                        if b == '\x07' {
-                            break;
-                        }
-                        if b == '\x1b' && chars.peek() == Some(&'\\') {
-                            chars.next();
-                            break;
-                        }
-                    }
-                    continue;
-                }
+/// Filter ANSI escape sequences and normalize control characters across buffer chunks
+fn clean_terminal_output(raw: &str, leftover: &mut String) -> String {
+    let combined = format!("{}{}", leftover, raw);
+    leftover.clear();
+
+    let bytes = combined.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+
+    while i < len {
+        let b = bytes[i];
+        if b == 0x1b {
+            if i + 1 >= len {
+                *leftover = String::from_utf8_lossy(&bytes[i..]).to_string();
+                break;
             }
-        } else if c == '\r' {
-            // Drop carriage return (\r); standard \n handles line wrapping
-            continue;
-        } else if c == '\x08' {
-            // Backspace character
-            out.pop();
+            let next = bytes[i + 1];
+            if next == b'[' {
+                let mut j = i + 2;
+                let mut found = false;
+                while j < len {
+                    if (0x40..=0x7e).contains(&bytes[j]) {
+                        found = true;
+                        i = j + 1;
+                        break;
+                    }
+                    j += 1;
+                }
+                if !found {
+                    *leftover = String::from_utf8_lossy(&bytes[i..]).to_string();
+                    break;
+                }
+            } else if next == b']' {
+                let mut j = i + 2;
+                let mut found = false;
+                while j < len {
+                    if bytes[j] == 0x07 {
+                        found = true;
+                        i = j + 1;
+                        break;
+                    }
+                    if bytes[j] == 0x1b && j + 1 < len && bytes[j + 1] == b'\\' {
+                        found = true;
+                        i = j + 2;
+                        break;
+                    }
+                    j += 1;
+                }
+                if !found {
+                    *leftover = String::from_utf8_lossy(&bytes[i..]).to_string();
+                    break;
+                }
+            } else {
+                i += 2;
+            }
+        } else if b == b'\r' {
+            if i + 1 < len && bytes[i + 1] == b'\n' {
+                i += 1;
+            } else {
+                while let Some(last) = out.chars().last() {
+                    if last == '\n' {
+                        break;
+                    }
+                    out.pop();
+                }
+                i += 1;
+            }
+        } else if b == 0x08 {
+            if out.chars().last() != Some('\n') {
+                out.pop();
+            }
+            i += 1;
         } else {
-            out.push(c);
+            let s = &combined[i..];
+            if let Some(ch) = s.chars().next() {
+                out.push(ch);
+                i += ch.len_utf8();
+            } else {
+                i += 1;
+            }
         }
     }
+
     out
 }
 
@@ -131,6 +173,7 @@ fn create_app_icon() -> egui::IconData {
 struct NeoTerminalApp {
     dark_mode: bool,
     terminal_output: String,
+    ansi_leftover: String,
     input_text: String,
     cursor_pos: usize,
     history: Vec<String>,
@@ -150,23 +193,29 @@ impl NeoTerminalApp {
             pixel_height: 0,
         })?;
 
-        // On Windows, invoke PowerShell through the native console host to ensure clean DLL initialization
+        // On Windows, spawn PowerShell directly with inherited environment
         #[cfg(target_os = "windows")]
-        let mut cmd = {
-            let mut c = CommandBuilder::new("cmd.exe");
-            c.args(["/k", "powershell.exe -NoLogo"]);
+        let cmd = {
+            let mut c = CommandBuilder::new("powershell.exe");
+            c.args(["-NoLogo"]);
+            for (k, v) in std::env::vars_os() {
+                c.env(k, v);
+            }
+            if let Ok(home) = std::env::var("USERPROFILE") {
+                c.cwd(home);
+            }
             c
         };
 
         #[cfg(not(target_os = "windows"))]
         let mut cmd = {
             let shell_cmd = std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string());
-            CommandBuilder::new(shell_cmd)
+            let mut c = CommandBuilder::new(shell_cmd);
+            if let Ok(dir) = std::env::current_dir() {
+                c.cwd(dir);
+            }
+            c
         };
-
-        if let Ok(dir) = std::env::current_dir() {
-            cmd.cwd(dir);
-        }
 
         let _child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
@@ -199,6 +248,7 @@ impl NeoTerminalApp {
         let app = Self {
             dark_mode: true,
             terminal_output: String::new(),
+            ansi_leftover: String::new(),
             input_text: String::new(),
             cursor_pos: 0,
             history: Vec::new(),
@@ -238,9 +288,9 @@ impl NeoTerminalApp {
 
         let trimmed = cmd.trim();
         if trimmed.is_empty() {
-            // Send empty newline to shell
+            // Send empty newline (Carriage Return) to shell
             if let Ok(mut w) = self.writer.lock() {
-                let _ = writeln!(w);
+                let _ = w.write_all(b"\r");
                 let _ = w.flush();
             }
             return;
@@ -267,9 +317,9 @@ impl NeoTerminalApp {
             return;
         }
 
-        // Send normal command to shell thread
+        // Send normal command to shell thread using Carriage Return \r for interactive execution
         if let Ok(mut w) = self.writer.lock() {
-            let _ = writeln!(w, "{}", cmd);
+            let _ = w.write_all(format!("{}\r", cmd).as_bytes());
             let _ = w.flush();
         }
     }
@@ -279,7 +329,7 @@ impl eframe::App for NeoTerminalApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Read any incoming shell output
         while let Ok(msg) = self.rx.try_recv() {
-            let cleaned = clean_terminal_output(&msg);
+            let cleaned = clean_terminal_output(&msg, &mut self.ansi_leftover);
             self.terminal_output.push_str(&cleaned);
 
             // Cap output to prevent unbounded memory growth
@@ -325,6 +375,20 @@ impl eframe::App for NeoTerminalApp {
                                 self.cursor_pos += 1;
                             }
                         }
+                    }
+                    egui::Event::Paste(text) => {
+                        let filtered = text
+                            .replace("\r\n", " ")
+                            .replace('\n', " ")
+                            .replace('\r', " ");
+                        let byte_pos = self
+                            .input_text
+                            .char_indices()
+                            .nth(self.cursor_pos)
+                            .map(|(idx, _)| idx)
+                            .unwrap_or(self.input_text.len());
+                        self.input_text.insert_str(byte_pos, &filtered);
+                        self.cursor_pos += filtered.chars().count();
                     }
                     egui::Event::Key {
                         key,

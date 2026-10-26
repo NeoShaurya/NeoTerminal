@@ -92,10 +92,11 @@ cargo run
 cargo build --release
 ```
 
-The compiled standalone executable will be located at:
+The compiled standalone executable is located at:
 ```
-target/release/NeoTerminal.exe
+./NeoTerminal.exe
 ```
+(or in `target/release/NeoTerminal.exe` after building)
 
 ---
 
