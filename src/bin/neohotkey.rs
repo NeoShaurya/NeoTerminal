@@ -31,6 +31,12 @@ struct MSG {
 #[link(name = "kernel32")]
 extern "system" {
     fn GetModuleHandleW(lpModuleName: *const u16) -> *mut std::ffi::c_void;
+    fn CreateMutexW(
+        lpMutexAttributes: *mut std::ffi::c_void,
+        bInitialOwner: i32,
+        lpName: *const u16,
+    ) -> *mut std::ffi::c_void;
+    fn GetLastError() -> u32;
 }
 
 #[link(name = "user32")]
@@ -74,7 +80,12 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: usize, lparam: isize) -> 
         if is_win_q || is_ctrl_alt_t {
             if kbd.time.wrapping_sub(LAST_LAUNCH) > 600 {
                 LAST_LAUNCH = kbd.time;
-                let _ = Command::new("C:\\Users\\shaur\\Documents\\antigravity\\bold-galileo\\NeoTerminal\\target\\release\\NeoTerminal.exe").spawn();
+                let exe_path = if std::path::Path::new("C:\\Users\\shaur\\NeoTerminal.exe").exists() {
+                    "C:\\Users\\shaur\\NeoTerminal.exe"
+                } else {
+                    "C:\\Users\\shaur\\Documents\\antigravity\\bold-galileo\\NeoTerminal\\target\\release\\NeoTerminal.exe"
+                };
+                let _ = Command::new(exe_path).spawn();
             }
             return 1;
         }
@@ -84,6 +95,15 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: usize, lparam: isize) -> 
 
 fn main() {
     unsafe {
+        // Enforce single-instance mutex to prevent duplicate daemons
+        let mutex_name: Vec<u16> = "Global\\NeoTerminalHotkeyDaemonMutex\0"
+            .encode_utf16()
+            .collect();
+        let mutex = CreateMutexW(std::ptr::null_mut(), 0, mutex_name.as_ptr());
+        if mutex.is_null() || GetLastError() == 183 {
+            return;
+        }
+
         let hmod = GetModuleHandleW(std::ptr::null());
         let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), hmod, 0);
         if hook.is_null() {
