@@ -753,7 +753,7 @@ impl eframe::App for NeoTerminalApp {
                                 .color(btn_fg),
                         )
                         .fill(btn_bg)
-                        .stroke(Stroke::new(2.0_f32, border_color))
+                        .stroke(Stroke::new(4.0_f32, border_color))
                         .rounding(Rounding::ZERO);
 
                         if ui.add(toggle_btn).clicked() {
@@ -796,7 +796,7 @@ impl eframe::App for NeoTerminalApp {
 
                         egui::Frame::none()
                             .fill(tab_bg)
-                            .stroke(Stroke::new(2.0_f32, border_color))
+                            .stroke(Stroke::new(4.0_f32, border_color))
                             .rounding(Rounding::ZERO)
                             .inner_margin(Margin::symmetric(8.0, 5.0))
                             .show(ui, |ui| {
@@ -843,7 +843,7 @@ impl eframe::App for NeoTerminalApp {
                             .color(fg_color),
                     )
                     .fill(bg_color)
-                    .stroke(Stroke::new(2.0_f32, border_color))
+                    .stroke(Stroke::new(4.0_f32, border_color))
                     .rounding(Rounding::ZERO);
 
                     if ui.add(add_btn).clicked() {
@@ -909,7 +909,7 @@ impl eframe::App for NeoTerminalApp {
                     // Input Field with Solid Block Cursor █ Matching Theme Text Color
                     egui::Frame::none()
                         .fill(bg_color)
-                        .stroke(Stroke::new(2.0_f32, border_color))
+                        .stroke(Stroke::new(4.0_f32, border_color))
                         .inner_margin(Margin::symmetric(10.0, 8.0))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
