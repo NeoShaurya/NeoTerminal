@@ -178,43 +178,24 @@ fn create_app_icon() -> egui::IconData {
     }
 }
 
-struct NeoTerminalApp {
-    dark_mode: bool,
+struct TerminalTab {
+    _id: usize,
+    title: String,
     terminal_output: String,
     ansi_leftover: String,
     input_text: String,
     cursor_pos: usize,
     history: Vec<String>,
     history_idx: Option<usize>,
+    has_unread: bool,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     rx: Receiver<String>,
     _master: Box<dyn portable_pty::MasterPty + Send>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
 }
 
-impl NeoTerminalApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Result<Self, Box<dyn std::error::Error>> {
-        // Load bold native monospace font for punchy Neo-Brutalist typography
-        let mut fonts = egui::FontDefinitions::default();
-        if let Ok(font_bytes) = std::fs::read("C:\\Windows\\Fonts\\consolab.ttf") {
-            fonts.font_data.insert(
-                "consolas_bold".to_owned(),
-                egui::FontData::from_owned(font_bytes),
-            );
-            fonts
-                .families
-                .entry(egui::FontFamily::Monospace)
-                .or_default()
-                .insert(0, "consolas_bold".to_owned());
-            fonts
-                .families
-                .entry(egui::FontFamily::Proportional)
-                .or_default()
-                .insert(0, "consolas_bold".to_owned());
-        }
-        cc.egui_ctx.set_fonts(fonts);
-
-        // Backend: Use portable-pty to spawn the default system shell
+impl TerminalTab {
+    fn new(id: usize, title: String, egui_ctx: egui::Context) -> Result<Self, Box<dyn std::error::Error>> {
         let pty_system = NativePtySystem::default();
         let pair = pty_system.openpty(PtySize {
             rows: 32,
@@ -287,7 +268,7 @@ impl NeoTerminalApp {
 
         // Background thread using std::sync::mpsc to read shell output and send it to the GUI
         let (tx, rx) = channel::<String>();
-        let egui_ctx = cc.egui_ctx.clone();
+        let ctx = egui_ctx.clone();
 
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
@@ -299,49 +280,28 @@ impl NeoTerminalApp {
                         if tx.send(text).is_err() {
                             break;
                         }
-                        egui_ctx.request_repaint();
+                        ctx.request_repaint();
                     }
                     Err(_) => break,
                 }
             }
         });
 
-        let app = Self {
-            dark_mode: true,
+        Ok(Self {
+            _id: id,
+            title,
             terminal_output: String::new(),
             ansi_leftover: String::new(),
             input_text: String::new(),
             cursor_pos: 0,
             history: Vec::new(),
             history_idx: None,
+            has_unread: false,
             writer,
             rx,
             _master: pair.master,
             _child: child,
-        };
-
-        app.apply_theme(&cc.egui_ctx);
-        Ok(app)
-    }
-
-    fn apply_theme(&self, ctx: &egui::Context) {
-        let (bg_color, fg_color) = if self.dark_mode {
-            (Color32::from_rgb(0, 0, 0), Color32::from_rgb(255, 255, 255))
-        } else {
-            (Color32::from_rgb(255, 255, 255), Color32::from_rgb(0, 0, 0))
-        };
-
-        let mut visuals = if self.dark_mode {
-            Visuals::dark()
-        } else {
-            Visuals::light()
-        };
-
-        visuals.panel_fill = bg_color;
-        visuals.window_fill = bg_color;
-        visuals.override_text_color = Some(fg_color);
-        visuals.extreme_bg_color = bg_color;
-        ctx.set_visuals(visuals);
+        })
     }
 
     fn submit_command(&mut self, ctx: &egui::Context) {
@@ -361,6 +321,20 @@ impl NeoTerminalApp {
 
         // Store into command history
         self.history.push(cmd.clone());
+
+        // Custom tab rename command: 'title <name>' or 'rename <name>'
+        let lower = trimmed.to_lowercase();
+        if lower.starts_with("title ") || lower.starts_with("rename ") {
+            if let Some(space_idx) = trimmed.find(' ') {
+                let new_title = trimmed[space_idx + 1..].trim().to_uppercase();
+                if !new_title.is_empty() {
+                    self.title = new_title;
+                    self.terminal_output
+                        .push_str(&format!("PS > {}\nTab renamed to '{}'\n\n", cmd, self.title));
+                    return;
+                }
+            }
+        }
 
         // Easter Egg 1: Intercept 'neofetch' to print custom ASCII art for 'NeoShaurya'
         if trimmed.eq_ignore_ascii_case("neofetch") {
@@ -389,23 +363,147 @@ impl NeoTerminalApp {
     }
 }
 
+struct NeoTerminalApp {
+    dark_mode: bool,
+    tabs: Vec<TerminalTab>,
+    active_tab: usize,
+    next_tab_id: usize,
+}
+
+impl NeoTerminalApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Result<Self, Box<dyn std::error::Error>> {
+        // Load bold native monospace font for punchy Neo-Brutalist typography
+        let mut fonts = egui::FontDefinitions::default();
+        if let Ok(font_bytes) = std::fs::read("C:\\Windows\\Fonts\\consolab.ttf") {
+            fonts.font_data.insert(
+                "consolas_bold".to_owned(),
+                egui::FontData::from_owned(font_bytes),
+            );
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .insert(0, "consolas_bold".to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "consolas_bold".to_owned());
+        }
+        cc.egui_ctx.set_fonts(fonts);
+
+        let initial_tab = TerminalTab::new(1, "SHELL 01".to_string(), cc.egui_ctx.clone())?;
+
+        let app = Self {
+            dark_mode: true,
+            tabs: vec![initial_tab],
+            active_tab: 0,
+            next_tab_id: 2,
+        };
+
+        app.apply_theme(&cc.egui_ctx);
+        Ok(app)
+    }
+
+    fn new_tab(&mut self, ctx: &egui::Context) {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let title = format!("SHELL {:02}", id);
+        match TerminalTab::new(id, title, ctx.clone()) {
+            Ok(tab) => {
+                self.tabs.push(tab);
+                self.active_tab = self.tabs.len() - 1;
+            }
+            Err(e) => {
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    tab.terminal_output
+                        .push_str(&format!("\n[ERROR] Failed to spawn new tab: {:?}\n", e));
+                }
+            }
+        }
+    }
+
+    fn close_tab(&mut self, index: usize, ctx: &egui::Context) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        if self.tabs.len() > 1 {
+            self.tabs.remove(index);
+            if self.active_tab >= self.tabs.len() {
+                self.active_tab = self.tabs.len() - 1;
+            } else if self.active_tab > index {
+                self.active_tab -= 1;
+            }
+            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                tab.has_unread = false;
+            }
+        } else {
+            // Replace only remaining tab with a fresh one
+            let id = self.next_tab_id;
+            self.next_tab_id += 1;
+            let title = format!("SHELL {:02}", id);
+            if let Ok(new_tab) = TerminalTab::new(id, title, ctx.clone()) {
+                self.tabs = vec![new_tab];
+                self.active_tab = 0;
+            } else if let Some(tab) = self.tabs.get_mut(0) {
+                tab.terminal_output.clear();
+            }
+        }
+    }
+
+    fn apply_theme(&self, ctx: &egui::Context) {
+        let (bg_color, fg_color) = if self.dark_mode {
+            (Color32::from_rgb(0, 0, 0), Color32::from_rgb(255, 255, 255))
+        } else {
+            (Color32::from_rgb(255, 255, 255), Color32::from_rgb(0, 0, 0))
+        };
+
+        let mut visuals = if self.dark_mode {
+            Visuals::dark()
+        } else {
+            Visuals::light()
+        };
+
+        visuals.panel_fill = bg_color;
+        visuals.window_fill = bg_color;
+        visuals.override_text_color = Some(fg_color);
+        visuals.extreme_bg_color = bg_color;
+        ctx.set_visuals(visuals);
+    }
+}
+
 impl eframe::App for NeoTerminalApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Read any incoming shell output
-        while let Ok(msg) = self.rx.try_recv() {
-            let cleaned = clean_terminal_output(&msg, &mut self.ansi_leftover);
-            self.terminal_output.push_str(&cleaned);
+        // Ensure at least one tab exists and active_tab is in bounds
+        if self.tabs.is_empty() {
+            self.new_tab(ctx);
+        }
+        if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len().saturating_sub(1);
+        }
 
-            // Cap output to prevent unbounded memory growth (UTF-8 character boundary safe)
-            if self.terminal_output.len() > 100_000 {
-                let excess = self.terminal_output.len() - 100_000;
-                if let Some((idx, _)) = self
-                    .terminal_output
-                    .char_indices()
-                    .find(|(idx, _)| *idx >= excess)
-                {
-                    self.terminal_output.drain(..idx);
+        // Drain incoming shell output for all tabs
+        for (idx, tab) in self.tabs.iter_mut().enumerate() {
+            let mut received = false;
+            while let Ok(msg) = tab.rx.try_recv() {
+                let cleaned = clean_terminal_output(&msg, &mut tab.ansi_leftover);
+                tab.terminal_output.push_str(&cleaned);
+                received = true;
+
+                // Cap output to prevent unbounded memory growth (UTF-8 character boundary safe)
+                if tab.terminal_output.len() > 100_000 {
+                    let excess = tab.terminal_output.len() - 100_000;
+                    if let Some((i, _)) = tab
+                        .terminal_output
+                        .char_indices()
+                        .find(|(i, _)| *i >= excess)
+                    {
+                        tab.terminal_output.drain(..i);
+                    }
                 }
+            }
+            if received && idx != self.active_tab {
+                tab.has_unread = true;
             }
         }
 
@@ -429,20 +527,32 @@ impl eframe::App for NeoTerminalApp {
         self.apply_theme(ctx);
 
         // Keystroke Capture
+        let mut action_new_tab = false;
+        let mut action_close_tab = false;
+        let mut action_next_tab = false;
+        let mut action_prev_tab = false;
+        let mut action_select_tab: Option<usize> = None;
+
         ctx.input(|i| {
+            if self.tabs.is_empty() {
+                return;
+            }
+            let active_idx = self.active_tab.min(self.tabs.len() - 1);
+            let tab = &mut self.tabs[active_idx];
+
             for event in &i.events {
                 match event {
                     egui::Event::Text(text) => {
                         for ch in text.chars() {
                             if !ch.is_control() {
-                                let byte_pos = self
+                                let byte_pos = tab
                                     .input_text
                                     .char_indices()
-                                    .nth(self.cursor_pos)
+                                    .nth(tab.cursor_pos)
                                     .map(|(idx, _)| idx)
-                                    .unwrap_or(self.input_text.len());
-                                self.input_text.insert(byte_pos, ch);
-                                self.cursor_pos += 1;
+                                    .unwrap_or(tab.input_text.len());
+                                tab.input_text.insert(byte_pos, ch);
+                                tab.cursor_pos += 1;
                             }
                         }
                     }
@@ -451,14 +561,14 @@ impl eframe::App for NeoTerminalApp {
                             .replace("\r\n", " ")
                             .replace('\n', " ")
                             .replace('\r', " ");
-                        let byte_pos = self
+                        let byte_pos = tab
                             .input_text
                             .char_indices()
-                            .nth(self.cursor_pos)
+                            .nth(tab.cursor_pos)
                             .map(|(idx, _)| idx)
-                            .unwrap_or(self.input_text.len());
-                        self.input_text.insert_str(byte_pos, &filtered);
-                        self.cursor_pos += filtered.chars().count();
+                            .unwrap_or(tab.input_text.len());
+                        tab.input_text.insert_str(byte_pos, &filtered);
+                        tab.cursor_pos += filtered.chars().count();
                     }
                     egui::Event::Key {
                         key,
@@ -467,91 +577,134 @@ impl eframe::App for NeoTerminalApp {
                         ..
                     } => match key {
                         Key::Enter => {
-                            self.submit_command(ctx);
+                            tab.submit_command(ctx);
                         }
                         Key::Backspace => {
-                            if self.cursor_pos > 0 && !self.input_text.is_empty() {
-                                self.cursor_pos -= 1;
-                                let byte_pos = self
+                            if tab.cursor_pos > 0 && !tab.input_text.is_empty() {
+                                tab.cursor_pos -= 1;
+                                let byte_pos = tab
                                     .input_text
                                     .char_indices()
-                                    .nth(self.cursor_pos)
+                                    .nth(tab.cursor_pos)
                                     .map(|(idx, _)| idx)
                                     .unwrap_or(0);
-                                self.input_text.remove(byte_pos);
+                                tab.input_text.remove(byte_pos);
                             }
                         }
                         Key::Delete => {
-                            if self.cursor_pos < self.input_text.chars().count() {
-                                let byte_pos = self
+                            if tab.cursor_pos < tab.input_text.chars().count() {
+                                let byte_pos = tab
                                     .input_text
                                     .char_indices()
-                                    .nth(self.cursor_pos)
+                                    .nth(tab.cursor_pos)
                                     .map(|(idx, _)| idx)
-                                    .unwrap_or(self.input_text.len());
-                                self.input_text.remove(byte_pos);
+                                    .unwrap_or(tab.input_text.len());
+                                tab.input_text.remove(byte_pos);
                             }
                         }
                         Key::ArrowLeft => {
-                            if self.cursor_pos > 0 {
-                                self.cursor_pos -= 1;
+                            if tab.cursor_pos > 0 {
+                                tab.cursor_pos -= 1;
                             }
                         }
                         Key::ArrowRight => {
-                            if self.cursor_pos < self.input_text.chars().count() {
-                                self.cursor_pos += 1;
+                            if tab.cursor_pos < tab.input_text.chars().count() {
+                                tab.cursor_pos += 1;
                             }
                         }
                         Key::Home => {
-                            self.cursor_pos = 0;
+                            tab.cursor_pos = 0;
                         }
                         Key::End => {
-                            self.cursor_pos = self.input_text.chars().count();
+                            tab.cursor_pos = tab.input_text.chars().count();
                         }
                         Key::ArrowUp => {
-                            if !self.history.is_empty() {
-                                let next_idx = match self.history_idx {
-                                    None => self.history.len() - 1,
+                            if !tab.history.is_empty() {
+                                let next_idx = match tab.history_idx {
+                                    None => tab.history.len() - 1,
                                     Some(idx) if idx > 0 => idx - 1,
                                     Some(idx) => idx,
                                 };
-                                self.history_idx = Some(next_idx);
-                                self.input_text = self.history[next_idx].clone();
-                                self.cursor_pos = self.input_text.chars().count();
+                                tab.history_idx = Some(next_idx);
+                                tab.input_text = tab.history[next_idx].clone();
+                                tab.cursor_pos = tab.input_text.chars().count();
                             }
                         }
                         Key::ArrowDown => {
-                            if let Some(idx) = self.history_idx {
-                                if idx + 1 < self.history.len() {
-                                    self.history_idx = Some(idx + 1);
-                                    self.input_text = self.history[idx + 1].clone();
-                                    self.cursor_pos = self.input_text.chars().count();
+                            if let Some(idx) = tab.history_idx {
+                                if idx + 1 < tab.history.len() {
+                                    tab.history_idx = Some(idx + 1);
+                                    tab.input_text = tab.history[idx + 1].clone();
+                                    tab.cursor_pos = tab.input_text.chars().count();
                                 } else {
-                                    self.history_idx = None;
-                                    self.input_text.clear();
-                                    self.cursor_pos = 0;
+                                    tab.history_idx = None;
+                                    tab.input_text.clear();
+                                    tab.cursor_pos = 0;
                                 }
                             }
                         }
                         Key::C if modifiers.ctrl => {
-                            self.terminal_output
-                                .push_str(&format!("PS > {}^C\n", self.input_text));
-                            self.input_text.clear();
-                            self.cursor_pos = 0;
-                            if let Ok(mut w) = self.writer.lock() {
+                            tab.terminal_output
+                                .push_str(&format!("PS > {}^C\n", tab.input_text));
+                            tab.input_text.clear();
+                            tab.cursor_pos = 0;
+                            if let Ok(mut w) = tab.writer.lock() {
                                 let _ = w.write_all(b"\x03");
                                 let _ = w.flush();
                             }
                         }
                         Key::L if modifiers.ctrl => {
-                            self.terminal_output.clear();
+                            tab.terminal_output.clear();
                         }
+                        Key::T if modifiers.ctrl => {
+                            action_new_tab = true;
+                        }
+                        Key::W if modifiers.ctrl => {
+                            action_close_tab = true;
+                        }
+                        Key::Tab if modifiers.ctrl => {
+                            if modifiers.shift {
+                                action_prev_tab = true;
+                            } else {
+                                action_next_tab = true;
+                            }
+                        }
+                        Key::Num1 if modifiers.ctrl => { action_select_tab = Some(0); }
+                        Key::Num2 if modifiers.ctrl => { action_select_tab = Some(1); }
+                        Key::Num3 if modifiers.ctrl => { action_select_tab = Some(2); }
+                        Key::Num4 if modifiers.ctrl => { action_select_tab = Some(3); }
+                        Key::Num5 if modifiers.ctrl => { action_select_tab = Some(4); }
+                        Key::Num6 if modifiers.ctrl => { action_select_tab = Some(5); }
+                        Key::Num7 if modifiers.ctrl => { action_select_tab = Some(6); }
+                        Key::Num8 if modifiers.ctrl => { action_select_tab = Some(7); }
+                        Key::Num9 if modifiers.ctrl => { action_select_tab = Some(8); }
                         _ => {}
                     },
                     _ => {}
                 }
             }
         });
+
+        if action_new_tab {
+            self.new_tab(ctx);
+        } else if action_close_tab {
+            self.close_tab(self.active_tab, ctx);
+        } else if action_next_tab && !self.tabs.is_empty() {
+            self.active_tab = (self.active_tab + 1) % self.tabs.len();
+            self.tabs[self.active_tab].has_unread = false;
+        } else if action_prev_tab && !self.tabs.is_empty() {
+            self.active_tab = if self.active_tab == 0 {
+                self.tabs.len() - 1
+            } else {
+                self.active_tab - 1
+            };
+            self.tabs[self.active_tab].has_unread = false;
+        } else if let Some(target) = action_select_tab {
+            if target < self.tabs.len() {
+                self.active_tab = target;
+                self.tabs[self.active_tab].has_unread = false;
+            }
+        }
 
         // 4px Neo-Brutalist Outer Border & Layout
         let border_stroke = Stroke::new(4.0_f32, border_color);
@@ -620,24 +773,127 @@ impl eframe::App for NeoTerminalApp {
                     .rect_filled(rect_div1, Rounding::ZERO, border_color);
                 ui.add_space(8.0);
 
+                // Neo-Brutalist Tab Bar
+                let mut switch_to_tab: Option<usize> = None;
+                let mut close_tab_idx: Option<usize> = None;
+                let mut create_new_tab = false;
+
+                ui.horizontal(|ui| {
+                    for (idx, tab) in self.tabs.iter().enumerate() {
+                        let is_active = idx == self.active_tab;
+                        let (tab_bg, tab_fg) = if is_active {
+                            if self.dark_mode {
+                                (Color32::WHITE, Color32::BLACK)
+                            } else {
+                                (Color32::BLACK, Color32::WHITE)
+                            }
+                        } else {
+                            (bg_color, fg_color)
+                        };
+
+                        let unread_marker = if tab.has_unread && !is_active { " ●" } else { "" };
+                        let tab_label = format!(" {:02}: {}{} ", idx + 1, tab.title, unread_marker);
+
+                        egui::Frame::none()
+                            .fill(tab_bg)
+                            .stroke(Stroke::new(2.0_f32, border_color))
+                            .rounding(Rounding::ZERO)
+                            .inner_margin(Margin::symmetric(8.0, 5.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    let title_resp = ui.add(
+                                        egui::Label::new(
+                                            RichText::new(tab_label)
+                                                .font(FontId::monospace(12.5))
+                                                .strong()
+                                                .color(tab_fg),
+                                        )
+                                        .sense(egui::Sense::click()),
+                                    );
+                                    if title_resp.clicked() {
+                                        switch_to_tab = Some(idx);
+                                    }
+
+                                    if self.tabs.len() > 1 {
+                                        ui.add_space(2.0);
+                                        let close_resp = ui.add(
+                                            egui::Label::new(
+                                                RichText::new("×")
+                                                    .font(FontId::monospace(13.5))
+                                                    .strong()
+                                                    .color(tab_fg),
+                                            )
+                                            .sense(egui::Sense::click()),
+                                        );
+                                        if close_resp.clicked() {
+                                            close_tab_idx = Some(idx);
+                                        }
+                                    }
+                                });
+                            });
+
+                        ui.add_space(4.0);
+                    }
+
+                    // "+ NEW TAB" button
+                    let add_btn = egui::Button::new(
+                        RichText::new(" + NEW TAB ")
+                            .font(FontId::monospace(12.0))
+                            .strong()
+                            .color(fg_color),
+                    )
+                    .fill(bg_color)
+                    .stroke(Stroke::new(2.0_f32, border_color))
+                    .rounding(Rounding::ZERO);
+
+                    if ui.add(add_btn).clicked() {
+                        create_new_tab = true;
+                    }
+                });
+
+                if let Some(target) = switch_to_tab {
+                    if target < self.tabs.len() {
+                        self.active_tab = target;
+                        self.tabs[self.active_tab].has_unread = false;
+                    }
+                }
+                if let Some(target) = close_tab_idx {
+                    self.close_tab(target, ctx);
+                }
+                if create_new_tab {
+                    self.new_tab(ctx);
+                }
+
+                ui.add_space(8.0);
+                // 4px Neo-Brutalist Divider below Tab Bar
+                let (rect_div_tabs, _) = ui.allocate_exact_size(
+                    Vec2::new(ui.available_width(), 4.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter()
+                    .rect_filled(rect_div_tabs, Rounding::ZERO, border_color);
+                ui.add_space(8.0);
+
                 // Scrolling Terminal Output Area
                 let available_height = ui.available_height() - 56.0;
 
-                ScrollArea::vertical()
-                    .max_height(available_height)
-                    .auto_shrink([false, false])
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(&self.terminal_output)
-                                    .font(FontId::monospace(15.0))
-                                    .strong()
-                                    .color(fg_color),
-                            )
-                            .wrap_mode(egui::TextWrapMode::Wrap),
-                        );
-                    });
+                if let Some(active_tab) = self.tabs.get_mut(self.active_tab) {
+                    ScrollArea::vertical()
+                        .max_height(available_height)
+                        .auto_shrink([false, false])
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&active_tab.terminal_output)
+                                        .font(FontId::monospace(15.0))
+                                        .strong()
+                                        .color(fg_color),
+                                )
+                                .wrap_mode(egui::TextWrapMode::Wrap),
+                            );
+                        });
+                }
 
                 ui.add_space(8.0);
                 // 4px Neo-Brutalist Divider above Input Field
@@ -649,41 +905,43 @@ impl eframe::App for NeoTerminalApp {
                     .rect_filled(rect_div2, Rounding::ZERO, border_color);
                 ui.add_space(8.0);
 
-                // Input Field with Solid Block Cursor █ Matching Theme Text Color
-                egui::Frame::none()
-                    .fill(bg_color)
-                    .stroke(Stroke::new(2.0_f32, border_color))
-                    .inner_margin(Margin::symmetric(10.0, 8.0))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new("PS >")
-                                    .font(FontId::monospace(15.5))
-                                    .strong()
-                                    .color(fg_color),
-                            );
+                if let Some(active_tab) = self.tabs.get_mut(self.active_tab) {
+                    // Input Field with Solid Block Cursor █ Matching Theme Text Color
+                    egui::Frame::none()
+                        .fill(bg_color)
+                        .stroke(Stroke::new(2.0_f32, border_color))
+                        .inner_margin(Margin::symmetric(10.0, 8.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("PS >")
+                                        .font(FontId::monospace(15.5))
+                                        .strong()
+                                        .color(fg_color),
+                                );
 
-                            let byte_pos = self
-                                .input_text
-                                .char_indices()
-                                .nth(self.cursor_pos)
-                                .map(|(idx, _)| idx)
-                                .unwrap_or(self.input_text.len());
+                                let byte_pos = active_tab
+                                    .input_text
+                                    .char_indices()
+                                    .nth(active_tab.cursor_pos)
+                                    .map(|(idx, _)| idx)
+                                    .unwrap_or(active_tab.input_text.len());
 
-                            let before = &self.input_text[..byte_pos];
-                            let after = &self.input_text[byte_pos..];
+                                let before = &active_tab.input_text[..byte_pos];
+                                let after = &active_tab.input_text[byte_pos..];
 
-                            // Solid block cursor █ in current theme's text color
-                            let input_line = format!("{before}█{after}");
+                                // Solid block cursor █ in current theme's text color
+                                let input_line = format!("{before}█{after}");
 
-                            ui.label(
-                                RichText::new(input_line)
-                                    .font(FontId::monospace(15.5))
-                                    .strong()
-                                    .color(fg_color),
-                            );
+                                ui.label(
+                                    RichText::new(input_line)
+                                        .font(FontId::monospace(15.5))
+                                        .strong()
+                                        .color(fg_color),
+                                );
+                            });
                         });
-                    });
+                }
             });
     }
 }
@@ -909,6 +1167,37 @@ mod tests {
             accumulated.contains("Starting GitHub -> Portfolio Sync Pipeline"),
             "Output must show sync pipeline start"
         );
+    }
+
+    #[test]
+    fn test_tab_management_logic() {
+        let mut tab_count = 3;
+        let mut active = 2; // Active is the 3rd tab (index 2)
+
+        // Close tab 0 (earlier tab)
+        let closed = 0;
+        tab_count -= 1;
+        if active > closed {
+            active -= 1;
+        }
+        assert_eq!(active, 1);
+        assert_eq!(tab_count, 2);
+
+        // Now active is 1 (the last tab of 2). Close tab 1 (the active tab).
+        let _closed = 1;
+        tab_count -= 1;
+        if active >= tab_count {
+            active = tab_count - 1;
+        }
+        assert_eq!(active, 0);
+        assert_eq!(tab_count, 1);
+
+        // Test title parsing logic
+        let cmd = "title Scraper Engine";
+        let trimmed = cmd.trim();
+        let space_idx = trimmed.find(' ').unwrap();
+        let new_title = trimmed[space_idx + 1..].trim().to_uppercase();
+        assert_eq!(new_title, "SCRAPER ENGINE");
     }
 }
 

@@ -19,6 +19,16 @@ A high-performance, native desktop GUI terminal emulator built in **Rust**, powe
   - **Light Mode**: Pure white background (`#ffffff`), pure black text (`#000000`), and a **4px solid black border**.
   - Sharp corners, thick geometric dividers, and bold brutalist controls.
   - Seamless one-click instant theme toggle (`[● DARK MODE]` / `[○ LIGHT MODE]`) in the top-right corner.
+- **Brutalist Multi-Tabs**:
+  - Spawn and manage multiple independent ConPTY shell sessions simultaneously.
+  - Active tab highlighting, unread activity dot (`●`) for background tabs with new output.
+  - Fast tab creation (`[ + NEW TAB ]`), individual close buttons (`×`).
+  - Keyboard shortcuts:
+    - **`Ctrl + T`**: Open new tab.
+    - **`Ctrl + W`**: Close active tab.
+    - **`Ctrl + Tab`** / **`Ctrl + Shift + Tab`**: Cycle through tabs.
+    - **`Ctrl + 1`** to **`Ctrl + 9`**: Jump directly to tab 1 through 9.
+  - Interactive tab renaming: type **`title <name>`** or **`rename <name>`** (e.g., `title Scraper`) to rename the active tab.
 - **PTY Shell Backend**:
   - Spawns the default system shell (`PowerShell`) via Windows ConPTY using `portable-pty`.
   - Non-blocking background worker thread using `std::sync::mpsc` streaming shell output into the GUI.
