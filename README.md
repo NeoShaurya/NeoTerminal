@@ -29,6 +29,15 @@ A high-performance, native desktop GUI terminal emulator built in **Rust**, powe
     - **`Ctrl + Tab`** / **`Ctrl + Shift + Tab`**: Cycle through tabs.
     - **`Ctrl + 1`** to **`Ctrl + 9`**: Jump directly to tab 1 through 9.
   - Interactive tab renaming: type **`title <name>`** or **`rename <name>`** (e.g., `title Scraper`) to rename the active tab.
+- **Bottom Status Strip (System & Git Telemetry)**:
+  - Stark brutalist telemetry console along the bottom with uniform 4px borders.
+  - **`DIR`**: Displays current directory name.
+  - **`GIT`**: Auto-detects active Git branch (highlighted in inverted high contrast, e.g. `[ GIT: main ]`).
+  - **`RAM`**: Live hardware memory usage and system load (e.g. `[ RAM: 7.2G/16G (45%) ]`).
+  - **`TAB`**: Active and total tab count indicator (e.g. `[ TAB: 1/2 ]`).
+  - **`STATE`**: Real-time process execution status (`[ STATE: IDLE ]` vs. high-contrast `[ STATE: BUSY ● ]` when output is streaming).
+  - **`UP`**: Terminal session uptime counter (`[ UP: 12m 45s ]`).
+  - Right-aligned quick hotkey hint pill (`[ WIN+Q // CTRL+ALT+T ]`).
 - **PTY Shell Backend**:
   - Spawns the default system shell (`PowerShell`) via Windows ConPTY using `portable-pty`.
   - Non-blocking background worker thread using `std::sync::mpsc` streaming shell output into the GUI.

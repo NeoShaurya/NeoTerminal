@@ -8,11 +8,108 @@ use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use std::io::{Read, Write};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct MEMORYSTATUSEX {
+    dw_length: u32,
+    dw_memory_load: u32,
+    ull_total_phys: u64,
+    ull_avail_phys: u64,
+    ull_total_page_file: u64,
+    ull_avail_page_file: u64,
+    ull_total_virtual: u64,
+    ull_avail_virtual: u64,
+    ull_avail_extended_virtual: u64,
+}
 
 #[cfg(target_os = "windows")]
 #[link(name = "kernel32")]
 extern "system" {
     fn SetErrorMode(uMode: u32) -> u32;
+    fn GlobalMemoryStatusEx(lpBuffer: *mut MEMORYSTATUSEX) -> i32;
+}
+
+fn get_system_memory_info() -> Option<(u32, f32, f32)> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut mem: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        mem.dw_length = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        if unsafe { GlobalMemoryStatusEx(&mut mem) } != 0 {
+            let used_gb =
+                (mem.ull_total_phys - mem.ull_avail_phys) as f32 / (1024.0 * 1024.0 * 1024.0);
+            let total_gb = mem.ull_total_phys as f32 / (1024.0 * 1024.0 * 1024.0);
+            return Some((mem.dw_memory_load, used_gb, total_gb));
+        }
+    }
+    None
+}
+
+fn get_git_branch_info() -> Option<String> {
+    if let Ok(mut current) = std::env::current_dir() {
+        loop {
+            let head_path = current.join(".git").join("HEAD");
+            if head_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&head_path) {
+                    let trimmed = content.trim();
+                    if let Some(branch) = trimmed.strip_prefix("ref: refs/heads/") {
+                        return Some(branch.to_string());
+                    } else if trimmed.len() >= 7 {
+                        return Some(trimmed[..7].to_string());
+                    }
+                }
+                return Some("HEAD".to_string());
+            }
+            if !current.pop() {
+                break;
+            }
+        }
+    }
+    None
+}
+
+fn get_current_dir_name() -> String {
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(name) = cwd.file_name() {
+            return name.to_string_lossy().to_string();
+        }
+    }
+    "~".to_string()
+}
+
+fn render_status_badge(
+    ui: &mut egui::Ui,
+    label: &str,
+    is_inverted: bool,
+    bg_color: Color32,
+    fg_color: Color32,
+    border_color: Color32,
+    dark_mode: bool,
+) {
+    let (badge_bg, badge_fg) = if is_inverted {
+        if dark_mode {
+            (Color32::WHITE, Color32::BLACK)
+        } else {
+            (Color32::BLACK, Color32::WHITE)
+        }
+    } else {
+        (bg_color, fg_color)
+    };
+
+    egui::Frame::none()
+        .fill(badge_bg)
+        .stroke(Stroke::new(4.0_f32, border_color))
+        .rounding(Rounding::ZERO)
+        .inner_margin(Margin::symmetric(8.0, 4.0))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(label)
+                    .font(FontId::monospace(12.0))
+                    .strong()
+                    .color(badge_fg),
+            );
+        });
 }
 
 /// Filter ANSI escape sequences and normalize control characters across buffer chunks
@@ -188,6 +285,7 @@ struct TerminalTab {
     history: Vec<String>,
     history_idx: Option<usize>,
     has_unread: bool,
+    last_activity: Instant,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     rx: Receiver<String>,
     _master: Box<dyn portable_pty::MasterPty + Send>,
@@ -297,6 +395,7 @@ impl TerminalTab {
             history: Vec::new(),
             history_idx: None,
             has_unread: false,
+            last_activity: Instant::now(),
             writer,
             rx,
             _master: pair.master,
@@ -305,6 +404,7 @@ impl TerminalTab {
     }
 
     fn submit_command(&mut self, ctx: &egui::Context) {
+        self.last_activity = Instant::now();
         let cmd = std::mem::take(&mut self.input_text);
         self.cursor_pos = 0;
         self.history_idx = None;
@@ -368,6 +468,7 @@ struct NeoTerminalApp {
     tabs: Vec<TerminalTab>,
     active_tab: usize,
     next_tab_id: usize,
+    start_time: Instant,
 }
 
 impl NeoTerminalApp {
@@ -399,6 +500,7 @@ impl NeoTerminalApp {
             tabs: vec![initial_tab],
             active_tab: 0,
             next_tab_id: 2,
+            start_time: Instant::now(),
         };
 
         app.apply_theme(&cc.egui_ctx);
@@ -489,6 +591,7 @@ impl eframe::App for NeoTerminalApp {
                 let cleaned = clean_terminal_output(&msg, &mut tab.ansi_leftover);
                 tab.terminal_output.push_str(&cleaned);
                 received = true;
+                tab.last_activity = Instant::now();
 
                 // Cap output to prevent unbounded memory growth (UTF-8 character boundary safe)
                 if tab.terminal_output.len() > 100_000 {
@@ -875,7 +978,7 @@ impl eframe::App for NeoTerminalApp {
                 ui.add_space(8.0);
 
                 // Scrolling Terminal Output Area
-                let available_height = ui.available_height() - 56.0;
+                let available_height = (ui.available_height() - 108.0_f32).max(80.0_f32);
 
                 if let Some(active_tab) = self.tabs.get_mut(self.active_tab) {
                     ScrollArea::vertical()
@@ -942,6 +1045,123 @@ impl eframe::App for NeoTerminalApp {
                             });
                         });
                 }
+
+                ui.add_space(8.0);
+                // 4px Neo-Brutalist Divider above Bottom Status Strip
+                let (rect_div3, _) = ui.allocate_exact_size(
+                    Vec2::new(ui.available_width(), 4.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter()
+                    .rect_filled(rect_div3, Rounding::ZERO, border_color);
+                ui.add_space(8.0);
+
+                // Bottom Status Strip (System & Git Telemetry)
+                ui.horizontal(|ui| {
+                    // 1. Directory Badge
+                    let dir_name = get_current_dir_name();
+                    render_status_badge(
+                        ui,
+                        &format!("DIR: {dir_name}"),
+                        false,
+                        bg_color,
+                        fg_color,
+                        border_color,
+                        self.dark_mode,
+                    );
+                    ui.add_space(4.0);
+
+                    // 2. Git Branch Badge
+                    if let Some(branch) = get_git_branch_info() {
+                        render_status_badge(
+                            ui,
+                            &format!("GIT: {branch}"),
+                            true,
+                            bg_color,
+                            fg_color,
+                            border_color,
+                            self.dark_mode,
+                        );
+                        ui.add_space(4.0);
+                    }
+
+                    // 3. System Memory Badge
+                    if let Some((load, used_gb, total_gb)) = get_system_memory_info() {
+                        render_status_badge(
+                            ui,
+                            &format!("RAM: {used_gb:.1}G/{total_gb:.0}G ({load}%)"),
+                            false,
+                            bg_color,
+                            fg_color,
+                            border_color,
+                            self.dark_mode,
+                        );
+                        ui.add_space(4.0);
+                    }
+
+                    // 4. Tab Status Badge
+                    let total_tabs = self.tabs.len();
+                    let current_tab_num = self.active_tab + 1;
+                    render_status_badge(
+                        ui,
+                        &format!("TAB: {current_tab_num}/{total_tabs}"),
+                        false,
+                        bg_color,
+                        fg_color,
+                        border_color,
+                        self.dark_mode,
+                    );
+                    ui.add_space(4.0);
+
+                    // 5. Active Tab Execution State Badge
+                    let is_busy = self
+                        .tabs
+                        .get(self.active_tab)
+                        .map(|t| t.last_activity.elapsed() < Duration::from_millis(800))
+                        .unwrap_or(false);
+                    let (state_label, state_invert) = if is_busy {
+                        ("STATE: BUSY ●", true)
+                    } else {
+                        ("STATE: IDLE", false)
+                    };
+                    render_status_badge(
+                        ui,
+                        state_label,
+                        state_invert,
+                        bg_color,
+                        fg_color,
+                        border_color,
+                        self.dark_mode,
+                    );
+                    ui.add_space(4.0);
+
+                    // 6. Uptime Badge
+                    let up_secs = self.start_time.elapsed().as_secs();
+                    let up_mins = up_secs / 60;
+                    let up_rem_secs = up_secs % 60;
+                    render_status_badge(
+                        ui,
+                        &format!("UP: {up_mins}m {up_rem_secs:02}s"),
+                        false,
+                        bg_color,
+                        fg_color,
+                        border_color,
+                        self.dark_mode,
+                    );
+
+                    // Right-aligned hotkey pill
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        render_status_badge(
+                            ui,
+                            "WIN+Q // CTRL+ALT+T",
+                            false,
+                            bg_color,
+                            fg_color,
+                            border_color,
+                            self.dark_mode,
+                        );
+                    });
+                });
             });
     }
 }
@@ -1198,6 +1418,25 @@ mod tests {
         let space_idx = trimmed.find(' ').unwrap();
         let new_title = trimmed[space_idx + 1..].trim().to_uppercase();
         assert_eq!(new_title, "SCRAPER ENGINE");
+    }
+
+    #[test]
+    fn test_system_telemetry_functions() {
+        // Test memory info retrieval
+        if let Some((load, used_gb, total_gb)) = get_system_memory_info() {
+            assert!(load <= 100, "Memory load should be <= 100%");
+            assert!(total_gb > 0.0, "Total RAM should be greater than 0");
+            assert!(used_gb <= total_gb, "Used RAM should be <= Total RAM");
+        }
+
+        // Test current directory retrieval
+        let dir = get_current_dir_name();
+        assert!(!dir.is_empty(), "Directory name should not be empty");
+
+        // Test git branch retrieval within a git repo
+        if let Some(branch) = get_git_branch_info() {
+            assert!(!branch.is_empty(), "Branch name should not be empty");
+        }
     }
 }
 
