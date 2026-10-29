@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -37,6 +38,7 @@ extern "system" {
         lpName: *const u16,
     ) -> *mut std::ffi::c_void;
     fn GetLastError() -> u32;
+    fn SetLastError(dwErrCode: u32);
 }
 
 #[link(name = "user32")]
@@ -56,7 +58,11 @@ extern "system" {
 
 const WH_KEYBOARD_LL: i32 = 13;
 const WM_KEYDOWN: usize = 0x0100;
+const WM_KEYUP: usize = 0x0101;
 const WM_SYSKEYDOWN: usize = 0x0104;
+const WM_SYSKEYUP: usize = 0x0105;
+
+const LLKHF_INJECTED: u32 = 0x00000010;
 
 const VK_LWIN: i32 = 0x5B;
 const VK_RWIN: i32 = 0x5C;
@@ -65,11 +71,21 @@ const VK_MENU: i32 = 0x12;
 const VK_Q: u32 = 0x51;
 const VK_T: u32 = 0x54;
 
-static mut LAST_LAUNCH: u32 = 0;
+static mut LAST_LAUNCH: Option<Instant> = None;
+static mut KEY_ACTIVE: bool = false;
 
 unsafe extern "system" fn hook_proc(code: i32, wparam: usize, lparam: isize) -> isize {
-    if code >= 0 && (wparam == WM_KEYDOWN || wparam == WM_SYSKEYDOWN) {
+    if code >= 0 {
         let kbd = *(lparam as *const KBDLLHOOKSTRUCT);
+
+        // Ignore injected/synthetic keystrokes to prevent secondary hooks/overlays from double-firing
+        if (kbd.flags & LLKHF_INJECTED) != 0 {
+            return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
+        }
+
+        let is_key_down = wparam == WM_KEYDOWN || wparam == WM_SYSKEYDOWN;
+        let is_key_up = wparam == WM_KEYUP || wparam == WM_SYSKEYUP;
+
         let win_down = GetAsyncKeyState(VK_LWIN) < 0 || GetAsyncKeyState(VK_RWIN) < 0;
         let ctrl_down = GetAsyncKeyState(VK_CONTROL) < 0;
         let alt_down = GetAsyncKeyState(VK_MENU) < 0;
@@ -78,16 +94,36 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: usize, lparam: isize) -> 
         let is_ctrl_alt_t = ctrl_down && alt_down && kbd.vk_code == VK_T;
 
         if is_win_q || is_ctrl_alt_t {
-            if kbd.time.wrapping_sub(LAST_LAUNCH) > 600 {
-                LAST_LAUNCH = kbd.time;
-                let exe_path = if std::path::Path::new("C:\\Users\\shaur\\NeoTerminal.exe").exists() {
-                    "C:\\Users\\shaur\\NeoTerminal.exe"
-                } else {
-                    "C:\\Users\\shaur\\Documents\\antigravity\\bold-galileo\\NeoTerminal\\target\\release\\NeoTerminal.exe"
-                };
-                let _ = Command::new(exe_path).spawn();
+            if is_key_down {
+                // If this hotkey stroke is already actively held down, ignore repeated auto-repeat events
+                if !KEY_ACTIVE {
+                    KEY_ACTIVE = true;
+
+                    // Monotonic wall-clock debounce (at least 1000ms between launches)
+                    let should_launch = match LAST_LAUNCH {
+                        Some(last) => last.elapsed() >= Duration::from_millis(1000),
+                        None => true,
+                    };
+
+                    if should_launch {
+                        LAST_LAUNCH = Some(Instant::now());
+                        let exe_path = if std::path::Path::new("C:\\Users\\shaur\\NeoTerminal.exe").exists() {
+                            "C:\\Users\\shaur\\NeoTerminal.exe"
+                        } else {
+                            "C:\\Users\\shaur\\Documents\\antigravity\\bold-galileo\\NeoTerminal\\target\\release\\NeoTerminal.exe"
+                        };
+                        let _ = Command::new(exe_path).spawn();
+                    }
+                }
+                return 1;
             }
-            return 1;
+        }
+
+        // When any trigger or modifier key is released, reset the latch
+        if is_key_up {
+            if kbd.vk_code == VK_T || kbd.vk_code == VK_Q || !ctrl_down || !alt_down || !win_down {
+                KEY_ACTIVE = false;
+            }
         }
     }
     CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
@@ -96,7 +132,8 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: usize, lparam: isize) -> 
 fn main() {
     unsafe {
         // Enforce single-instance mutex to prevent duplicate daemons
-        let mutex_name: Vec<u16> = "Global\\NeoTerminalHotkeyDaemonMutex\0"
+        SetLastError(0);
+        let mutex_name: Vec<u16> = "Local\\NeoTerminalHotkeyDaemonMutex\0"
             .encode_utf16()
             .collect();
         let mutex = CreateMutexW(std::ptr::null_mut(), 0, mutex_name.as_ptr());

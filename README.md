@@ -1,14 +1,32 @@
 # NeoTerminal ⚡
 
-A high-performance, native desktop GUI terminal emulator built in **Rust**, powered by **eframe (egui)** and **portable-pty (ConPTY)** with a bold **Neo-Brutalist** aesthetic.
+> A high-performance native desktop terminal emulator built from scratch in **Rust**, powered by **Windows ConPTY** with an uncompromising, high-contrast **Neo-Brutalist design**.
 
 ---
 
 ## 📸 Screenshots
 
-| Dark Mode | Light Mode |
+| Dark Mode (Multi-Tabs & Status Strip) | Light Mode (High Contrast) |
 |:---:|:---:|
 | ![Dark Mode](assets/screenshots/dark_mode.png) | ![Light Mode](assets/screenshots/light_mode.png) |
+
+<p align="center">
+  <b>Built-in <code>neofetch</code> Easter Egg with Custom ASCII Art & System Specs</b><br><br>
+  <img src="assets/screenshots/neofetch.png" alt="NeoTerminal Neofetch" width="95%"/>
+</p>
+
+---
+
+## 🛠️ Skills & Technologies Used
+
+| Category | Details |
+| :--- | :--- |
+| **Core Languages** | **Rust** (100% native codebase) |
+| **GUI Framework** | **eframe / egui** (Immediate-mode native GUI, Consolas Bold typography) |
+| **Subsystems & APIs** | **Windows ConPTY** (`portable-pty`), **Win32 API** (`kernel32`), Low-Level Keyboard Hooks (`WH_KEYBOARD_LL`) |
+| **Architecture** | Multithreaded reader channels (`std::sync::mpsc`), Mutex-guarded PTY writers, Sub-millisecond rendering |
+| **Design System** | **Neo-Brutalism** (Uniform 4px borders, pure `#000000` / `#ffffff` palettes, zero corner rounding) |
+| **Tooling & Build** | **Cargo**, **Rustc**, **MinGW-w64 (w64devkit)**, **PowerShell**, **Git & GitHub** |
 
 ---
 
@@ -75,8 +93,9 @@ NeoTerminal/
 ├── assets/
 │   ├── NeoTerminal.ico            # Windows Application Icon
 │   └── screenshots/
-│       ├── dark_mode.png          # Dark Mode Preview
-│       └── light_mode.png         # Light Mode Preview
+│       ├── dark_mode.png          # Dark Mode (Tabs & Status Strip)
+│       ├── light_mode.png         # Light Mode Preview
+│       └── neofetch.png           # Custom Neofetch Easter Egg
 ├── .cargo/
 │   └── config.toml                # Linker & build configuration
 ├── src/
