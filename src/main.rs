@@ -1,14 +1,22 @@
 #![windows_subsystem = "windows"]
 
 use eframe::egui::{
-    self, Align, Color32, FontId, Key, Layout, Margin, RichText, Rounding, ScrollArea, Stroke,
-    Vec2, Visuals,
+    self, pos2, Align, Color32, FontId, Key, Layout, Margin, Rect, RichText, Rounding, ScrollArea,
+    Stroke, UiBuilder, Vec2, Visuals,
 };
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use std::io::{Read, Write};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+// Gumroad Neo-Brutalist Design Tokens (matching neoshaurya.com)
+pub const ACCENT_PINK: Color32 = Color32::from_rgb(255, 144, 232); // #ff90e8
+pub const ACCENT_YELLOW: Color32 = Color32::from_rgb(255, 201, 0); // #ffc900
+pub const ACCENT_TEAL: Color32 = Color32::from_rgb(35, 160, 148); // #23a094
+pub const ACCENT_ORANGE: Color32 = Color32::from_rgb(255, 92, 0); // #ff5c00
+pub const PITCH_BLACK: Color32 = Color32::from_rgb(0, 0, 0); // #000000
+pub const CRISP_WHITE: Color32 = Color32::from_rgb(255, 255, 255); // #ffffff
 
 #[cfg(target_os = "windows")]
 #[repr(C)]
@@ -176,38 +184,271 @@ fn append_persistent_history(cmd: &str) {
     }
 }
 
-fn render_status_badge(
+/// Renders a tactile Neo-Brutalist button matching neoshaurya.com:
+/// - 4px solid border
+/// - Solid hard drop shadow (0 blur)
+/// - Hover interaction: lifts by (-1px, -1px) with shadow expanding to (shadow_size + 1)
+/// - Active (click-down) interaction: depresses by (shadow_size - 1) into the shadow
+fn render_brutal_button(
     ui: &mut egui::Ui,
-    label: &str,
-    is_inverted: bool,
-    bg_color: Color32,
-    fg_color: Color32,
+    text: &str,
+    bg: Color32,
+    fg: Color32,
     border_color: Color32,
-    dark_mode: bool,
-) {
-    let (badge_bg, badge_fg) = if is_inverted {
-        if dark_mode {
-            (Color32::WHITE, Color32::BLACK)
+    shadow_color: Color32,
+    shadow_size: f32,
+    font_size: f32,
+) -> egui::Response {
+    let font_id = FontId::monospace(font_size);
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font_id, fg);
+    let pad_x = 10.0_f32;
+    let pad_y = 6.0_f32;
+    let content_size = Vec2::new(galley.size().x + pad_x * 2.0, galley.size().y + pad_y * 2.0);
+    let total_size = content_size + Vec2::new(shadow_size, shadow_size);
+
+    let (rect, response) = ui.allocate_exact_size(total_size, egui::Sense::click());
+
+    if ui.is_rect_visible(rect) {
+        let is_hovered = response.hovered();
+        let is_down = response.is_pointer_button_down_on();
+
+        let (fg_offset, current_shadow_offset) = if is_down {
+            (
+                Vec2::new(shadow_size - 1.0, shadow_size - 1.0),
+                Vec2::new(shadow_size, shadow_size),
+            )
+        } else if is_hovered {
+            (
+                Vec2::new(-1.0, -1.0),
+                Vec2::new(shadow_size + 1.0, shadow_size + 1.0),
+            )
         } else {
-            (Color32::BLACK, Color32::WHITE)
-        }
+            (
+                Vec2::ZERO,
+                Vec2::new(shadow_size, shadow_size),
+            )
+        };
+
+        let base_min = rect.min;
+        let shadow_rect = Rect::from_min_size(base_min + current_shadow_offset, content_size);
+        let fg_rect = Rect::from_min_size(base_min + fg_offset, content_size);
+
+        // 1. Paint hard drop shadow
+        ui.painter().rect_filled(shadow_rect, Rounding::ZERO, shadow_color);
+        // 2. Paint foreground button card
+        ui.painter().rect_filled(fg_rect, Rounding::ZERO, bg);
+        // 3. Paint 4px brutalist stroke
+        ui.painter().rect_stroke(fg_rect, Rounding::ZERO, Stroke::new(4.0_f32, border_color));
+        // 4. Paint monospace text
+        let text_pos = fg_rect.min + Vec2::new(pad_x, pad_y);
+        ui.painter().galley(text_pos, galley, fg);
+    }
+
+    response
+}
+
+/// Renders a solid Neo-Brutalist badge with a 4px border and hard offset drop shadow
+fn render_brutal_badge(
+    ui: &mut egui::Ui,
+    text: &str,
+    bg: Color32,
+    fg: Color32,
+    border_color: Color32,
+    shadow_color: Color32,
+    shadow_size: f32,
+    font_size: f32,
+) {
+    let font_id = FontId::monospace(font_size);
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font_id, fg);
+    let pad_x = 8.0_f32;
+    let pad_y = 4.0_f32;
+    let content_size = Vec2::new(galley.size().x + pad_x * 2.0, galley.size().y + pad_y * 2.0);
+    let total_size = content_size + Vec2::new(shadow_size, shadow_size);
+
+    let (rect, _) = ui.allocate_exact_size(total_size, egui::Sense::hover());
+
+    if ui.is_rect_visible(rect) {
+        let base_min = rect.min;
+        let shadow_rect = Rect::from_min_size(base_min + Vec2::new(shadow_size, shadow_size), content_size);
+        let fg_rect = Rect::from_min_size(base_min, content_size);
+
+        ui.painter().rect_filled(shadow_rect, Rounding::ZERO, shadow_color);
+        ui.painter().rect_filled(fg_rect, Rounding::ZERO, bg);
+        ui.painter().rect_stroke(fg_rect, Rounding::ZERO, Stroke::new(4.0_f32, border_color));
+        let text_pos = fg_rect.min + Vec2::new(pad_x, pad_y);
+        ui.painter().galley(text_pos, galley, fg);
+    }
+}
+
+/// Renders a Neo-Brutalist tab tile with active accent highlighting, unread indicator,
+/// close button, hover lift, and active depression.
+/// Returns (clicked_select_tab, clicked_close_tab).
+fn render_brutal_tab(
+    ui: &mut egui::Ui,
+    idx: usize,
+    title: &str,
+    is_active: bool,
+    has_unread: bool,
+    can_close: bool,
+    dark_mode: bool,
+    border_color: Color32,
+    shadow_color: Color32,
+) -> (bool, bool) {
+    let font_id = FontId::monospace(12.5);
+    let title_text = format!(" {:02}: {} ", idx + 1, title);
+
+    let (tab_bg, tab_fg, shadow_c) = if is_active {
+        (
+            ACCENT_YELLOW,
+            PITCH_BLACK,
+            if dark_mode { ACCENT_TEAL } else { PITCH_BLACK },
+        )
+    } else if dark_mode {
+        (PITCH_BLACK, CRISP_WHITE, shadow_color)
     } else {
-        (bg_color, fg_color)
+        (CRISP_WHITE, PITCH_BLACK, shadow_color)
     };
 
-    egui::Frame::none()
-        .fill(badge_bg)
-        .stroke(Stroke::new(4.0_f32, border_color))
-        .rounding(Rounding::ZERO)
-        .inner_margin(Margin::symmetric(8.0, 4.0))
-        .show(ui, |ui| {
-            ui.label(
-                RichText::new(label)
-                    .font(FontId::monospace(12.0))
-                    .strong()
-                    .color(badge_fg),
-            );
-        });
+    let title_galley = ui.painter().layout_no_wrap(title_text, font_id.clone(), tab_fg);
+
+    let unread_galley = if has_unread && !is_active {
+        Some(ui.painter().layout_no_wrap(" ● NEW".to_string(), font_id.clone(), ACCENT_PINK))
+    } else {
+        None
+    };
+
+    let close_galley = if can_close {
+        Some(ui.painter().layout_no_wrap(" × ".to_string(), FontId::monospace(14.0), tab_fg))
+    } else {
+        None
+    };
+
+    let pad_x = 8.0_f32;
+    let pad_y = 5.0_f32;
+    let mut inner_w = title_galley.size().x;
+    if let Some(ref ug) = unread_galley {
+        inner_w += ug.size().x;
+    }
+    if let Some(ref cg) = close_galley {
+        inner_w += cg.size().x + 2.0;
+    }
+    let inner_h = title_galley.size().y.max(close_galley.as_ref().map_or(0.0, |g| g.size().y));
+    let content_size = Vec2::new(inner_w + pad_x * 2.0, inner_h + pad_y * 2.0);
+    let shadow_size = if is_active { 4.0_f32 } else { 3.0_f32 };
+    let total_size = content_size + Vec2::new(shadow_size, shadow_size);
+
+    let (rect, response) = ui.allocate_exact_size(total_size, egui::Sense::click());
+    let mut clicked_tab = false;
+    let mut clicked_close = false;
+
+    if ui.is_rect_visible(rect) {
+        let is_hovered = response.hovered();
+        let is_down = response.is_pointer_button_down_on();
+
+        let (fg_offset, current_shadow_offset) = if is_down {
+            (
+                Vec2::new(shadow_size - 1.0, shadow_size - 1.0),
+                Vec2::new(shadow_size, shadow_size),
+            )
+        } else if is_hovered {
+            (
+                Vec2::new(-1.0, -1.0),
+                Vec2::new(shadow_size + 1.0, shadow_size + 1.0),
+            )
+        } else {
+            (
+                Vec2::ZERO,
+                Vec2::new(shadow_size, shadow_size),
+            )
+        };
+
+        let base_min = rect.min;
+        let shadow_rect = Rect::from_min_size(base_min + current_shadow_offset, content_size);
+        let fg_rect = Rect::from_min_size(base_min + fg_offset, content_size);
+
+        ui.painter().rect_filled(shadow_rect, Rounding::ZERO, shadow_c);
+        ui.painter().rect_filled(fg_rect, Rounding::ZERO, tab_bg);
+        ui.painter().rect_stroke(fg_rect, Rounding::ZERO, Stroke::new(4.0_f32, border_color));
+
+        let mut curr_x = fg_rect.min.x + pad_x;
+        let text_y = fg_rect.min.y + pad_y;
+        ui.painter().galley(pos2(curr_x, text_y), title_galley.clone(), tab_fg);
+        curr_x += title_galley.size().x;
+
+        if let Some(ug) = unread_galley {
+            ui.painter().galley(pos2(curr_x, text_y), ug.clone(), ACCENT_PINK);
+            curr_x += ug.size().x;
+        }
+
+        if let Some(cg) = close_galley {
+            curr_x += 2.0;
+            let close_rect = Rect::from_min_size(pos2(curr_x, text_y), cg.size());
+            let pointer_pos = ui.input(|i| i.pointer.hover_pos());
+            let close_hovered = pointer_pos.map_or(false, |p| close_rect.contains(p));
+
+            let close_fg = if close_hovered {
+                ACCENT_ORANGE
+            } else {
+                tab_fg
+            };
+            ui.painter().galley(pos2(curr_x, text_y), cg, close_fg);
+
+            if response.clicked() {
+                if close_hovered {
+                    clicked_close = true;
+                } else {
+                    clicked_tab = true;
+                }
+            }
+        } else if response.clicked() {
+            clicked_tab = true;
+        }
+    }
+
+    (clicked_tab, clicked_close)
+}
+
+/// Renders a full-width Neo-Brutalist card container with a 4px border and solid drop shadow
+fn render_brutal_card<R>(
+    ui: &mut egui::Ui,
+    height: f32,
+    bg: Color32,
+    border_color: Color32,
+    shadow_color: Color32,
+    shadow_size: f32,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let available_w = ui.available_width();
+    let content_w = (available_w - shadow_size).max(10.0);
+    let total_size = Vec2::new(available_w, height + shadow_size);
+
+    let (rect, _) = ui.allocate_exact_size(total_size, egui::Sense::hover());
+
+    let base_min = rect.min;
+    let fg_rect = Rect::from_min_size(base_min, Vec2::new(content_w, height));
+    let shadow_rect = Rect::from_min_size(base_min + Vec2::new(shadow_size, shadow_size), Vec2::new(content_w, height));
+
+    if ui.is_rect_visible(rect) {
+        ui.painter().rect_filled(shadow_rect, Rounding::ZERO, shadow_color);
+        ui.painter().rect_filled(fg_rect, Rounding::ZERO, bg);
+        ui.painter().rect_stroke(fg_rect, Rounding::ZERO, Stroke::new(4.0_f32, border_color));
+    }
+
+    let inner_rect = fg_rect.shrink2(Vec2::new(8.0, 6.0));
+    ui.allocate_new_ui(UiBuilder::new().max_rect(inner_rect), |child_ui| {
+        content(child_ui)
+    }).inner
+}
+
+/// Renders a 4px thick brutalist horizontal divider line
+fn render_brutal_divider(ui: &mut egui::Ui, border_color: Color32) {
+    ui.add_space(6.0);
+    let (rect_div, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), 4.0),
+        egui::Sense::hover(),
+    );
+    ui.painter().rect_filled(rect_div, Rounding::ZERO, border_color);
+    ui.add_space(6.0);
 }
 
 /// Filter ANSI escape sequences and normalize control characters across buffer chunks
@@ -691,9 +932,9 @@ impl NeoTerminalApp {
 
     fn apply_theme(&self, ctx: &egui::Context) {
         let (bg_color, fg_color) = if self.dark_mode {
-            (Color32::from_rgb(0, 0, 0), Color32::from_rgb(255, 255, 255))
+            (PITCH_BLACK, CRISP_WHITE)
         } else {
-            (Color32::from_rgb(255, 255, 255), Color32::from_rgb(0, 0, 0))
+            (CRISP_WHITE, PITCH_BLACK)
         };
 
         let mut visuals = if self.dark_mode {
@@ -706,6 +947,12 @@ impl NeoTerminalApp {
         visuals.window_fill = bg_color;
         visuals.override_text_color = Some(fg_color);
         visuals.extreme_bg_color = bg_color;
+        visuals.window_rounding = Rounding::ZERO;
+        visuals.widgets.noninteractive.rounding = Rounding::ZERO;
+        visuals.widgets.inactive.rounding = Rounding::ZERO;
+        visuals.widgets.hovered.rounding = Rounding::ZERO;
+        visuals.widgets.active.rounding = Rounding::ZERO;
+        visuals.widgets.open.rounding = Rounding::ZERO;
         ctx.set_visuals(visuals);
     }
 }
@@ -746,20 +993,22 @@ impl eframe::App for NeoTerminalApp {
             }
         }
 
-        // Neo-Brutalist Theme Colors:
-        // Dark Mode: Pure black background, pure white text, 4px white border
-        // Light Mode: Pure white background, pure black text, 4px black border
-        let (bg_color, fg_color, border_color) = if self.dark_mode {
+        // Gumroad Neo-Brutalist Theme Colors (matching neoshaurya.com):
+        // Dark Mode: Pure pitch black surface, crisp white text & borders, solid white/accent shadows
+        // Light Mode: Crisp white surface, pitch black text & borders, solid pitch black shadows
+        let (bg_color, fg_color, border_color, shadow_color) = if self.dark_mode {
             (
-                Color32::from_rgb(0, 0, 0),
-                Color32::from_rgb(255, 255, 255),
-                Color32::from_rgb(255, 255, 255),
+                PITCH_BLACK,
+                CRISP_WHITE,
+                CRISP_WHITE,
+                CRISP_WHITE,
             )
         } else {
             (
-                Color32::from_rgb(255, 255, 255),
-                Color32::from_rgb(0, 0, 0),
-                Color32::from_rgb(0, 0, 0),
+                CRISP_WHITE,
+                PITCH_BLACK,
+                PITCH_BLACK,
+                PITCH_BLACK,
             )
         };
 
@@ -1023,61 +1272,69 @@ impl eframe::App for NeoTerminalApp {
                     .inner_margin(Margin::same(14.0)),
             )
             .show(ctx, |ui| {
-                // Header: Title & Theme Toggle
+                // Header: Title, Engine Pill, Live Indicator, & Theme Toggle Button
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("NEOTERMINAL")
-                            .font(FontId::monospace(19.0))
-                            .strong()
-                            .color(fg_color),
+                    render_brutal_badge(
+                        ui,
+                        "⚡ NEOTERMINAL",
+                        ACCENT_YELLOW,
+                        PITCH_BLACK,
+                        border_color,
+                        shadow_color,
+                        4.0,
+                        14.5,
                     );
-                    ui.label(
-                        RichText::new("// POWERSHELL CONPTY")
-                            .font(FontId::monospace(13.0))
-                            .strong()
-                            .color(fg_color),
+                    ui.add_space(4.0);
+
+                    render_brutal_badge(
+                        ui,
+                        "POWERSHELL CONPTY",
+                        bg_color,
+                        fg_color,
+                        border_color,
+                        shadow_color,
+                        3.0,
+                        11.5,
+                    );
+                    ui.add_space(4.0);
+
+                    render_brutal_badge(
+                        ui,
+                        "● ONLINE",
+                        ACCENT_TEAL,
+                        PITCH_BLACK,
+                        border_color,
+                        shadow_color,
+                        3.0,
+                        11.5,
                     );
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        // Neo-Brutalist Theme Toggle Button (Only toggle button, no checkmark)
-                        let (btn_bg, btn_fg) = if self.dark_mode {
-                            (Color32::WHITE, Color32::BLACK)
+                        let (toggle_label, btn_bg, btn_fg, btn_shadow) = if self.dark_mode {
+                            ("● DARK MODE", CRISP_WHITE, PITCH_BLACK, ACCENT_YELLOW)
                         } else {
-                            (Color32::BLACK, Color32::WHITE)
+                            ("○ LIGHT MODE", PITCH_BLACK, CRISP_WHITE, PITCH_BLACK)
                         };
 
-                        let toggle_label = if self.dark_mode {
-                            "● DARK MODE"
-                        } else {
-                            "○ LIGHT MODE"
-                        };
-
-                        let toggle_btn = egui::Button::new(
-                            RichText::new(toggle_label)
-                                .font(FontId::monospace(13.0))
-                                .strong()
-                                .color(btn_fg),
+                        if render_brutal_button(
+                            ui,
+                            toggle_label,
+                            btn_bg,
+                            btn_fg,
+                            border_color,
+                            btn_shadow,
+                            3.0,
+                            12.0,
                         )
-                        .fill(btn_bg)
-                        .stroke(Stroke::new(4.0_f32, border_color))
-                        .rounding(Rounding::ZERO);
-
-                        if ui.add(toggle_btn).clicked() {
+                        .clicked()
+                        {
                             self.dark_mode = !self.dark_mode;
                             self.apply_theme(ctx);
                         }
                     });
                 });
 
-                ui.add_space(8.0);
-                // 4px Neo-Brutalist Divider
-                let (rect_div1, _) = ui.allocate_exact_size(
-                    Vec2::new(ui.available_width(), 4.0),
-                    egui::Sense::hover(),
-                );
-                ui.painter()
-                    .rect_filled(rect_div1, Rounding::ZERO, border_color);
-                ui.add_space(8.0);
+                render_brutal_divider(ui, border_color);
 
                 // Neo-Brutalist Tab Bar
                 let mut switch_to_tab: Option<usize> = None;
@@ -1087,72 +1344,38 @@ impl eframe::App for NeoTerminalApp {
                 ui.horizontal(|ui| {
                     for (idx, tab) in self.tabs.iter().enumerate() {
                         let is_active = idx == self.active_tab;
-                        let (tab_bg, tab_fg) = if is_active {
-                            if self.dark_mode {
-                                (Color32::WHITE, Color32::BLACK)
-                            } else {
-                                (Color32::BLACK, Color32::WHITE)
-                            }
-                        } else {
-                            (bg_color, fg_color)
-                        };
-
-                        let unread_marker = if tab.has_unread && !is_active { " ●" } else { "" };
-                        let tab_label = format!(" {:02}: {}{} ", idx + 1, tab.title, unread_marker);
-
-                        egui::Frame::none()
-                            .fill(tab_bg)
-                            .stroke(Stroke::new(4.0_f32, border_color))
-                            .rounding(Rounding::ZERO)
-                            .inner_margin(Margin::symmetric(8.0, 5.0))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    let title_resp = ui.add(
-                                        egui::Label::new(
-                                            RichText::new(tab_label)
-                                                .font(FontId::monospace(12.5))
-                                                .strong()
-                                                .color(tab_fg),
-                                        )
-                                        .sense(egui::Sense::click()),
-                                    );
-                                    if title_resp.clicked() {
-                                        switch_to_tab = Some(idx);
-                                    }
-
-                                    if self.tabs.len() > 1 {
-                                        ui.add_space(2.0);
-                                        let close_resp = ui.add(
-                                            egui::Label::new(
-                                                RichText::new("×")
-                                                    .font(FontId::monospace(13.5))
-                                                    .strong()
-                                                    .color(tab_fg),
-                                            )
-                                            .sense(egui::Sense::click()),
-                                        );
-                                        if close_resp.clicked() {
-                                            close_tab_idx = Some(idx);
-                                        }
-                                    }
-                                });
-                            });
-
+                        let (clicked_tab, clicked_close) = render_brutal_tab(
+                            ui,
+                            idx,
+                            &tab.title,
+                            is_active,
+                            tab.has_unread,
+                            self.tabs.len() > 1,
+                            self.dark_mode,
+                            border_color,
+                            shadow_color,
+                        );
+                        if clicked_tab {
+                            switch_to_tab = Some(idx);
+                        }
+                        if clicked_close {
+                            close_tab_idx = Some(idx);
+                        }
                         ui.add_space(4.0);
                     }
 
-                    // "+ NEW TAB" button
-                    let add_btn = egui::Button::new(
-                        RichText::new(" + NEW TAB ")
-                            .font(FontId::monospace(12.0))
-                            .strong()
-                            .color(fg_color),
+                    if render_brutal_button(
+                        ui,
+                        " + NEW TAB ",
+                        ACCENT_TEAL,
+                        PITCH_BLACK,
+                        border_color,
+                        shadow_color,
+                        3.0,
+                        12.0,
                     )
-                    .fill(bg_color)
-                    .stroke(Stroke::new(4.0_f32, border_color))
-                    .rounding(Rounding::ZERO);
-
-                    if ui.add(add_btn).clicked() {
+                    .clicked()
+                    {
                         create_new_tab = true;
                     }
                 });
@@ -1170,56 +1393,47 @@ impl eframe::App for NeoTerminalApp {
                     self.new_tab(ctx);
                 }
 
-                ui.add_space(8.0);
-                // 4px Neo-Brutalist Divider below Tab Bar
-                let (rect_div_tabs, _) = ui.allocate_exact_size(
-                    Vec2::new(ui.available_width(), 4.0),
-                    egui::Sense::hover(),
-                );
-                ui.painter()
-                    .rect_filled(rect_div_tabs, Rounding::ZERO, border_color);
-                ui.add_space(8.0);
+                render_brutal_divider(ui, border_color);
 
-                // Scrolling Terminal Output Area
+                // Scrolling Terminal Output Area in a Brutalist Screen Box
                 let is_searching = self
                     .tabs
                     .get(self.active_tab)
                     .map_or(false, |t| t.search_active);
-                let available_height = if is_searching {
-                    (ui.available_height() - 290.0_f32).max(60.0_f32)
-                } else {
-                    (ui.available_height() - 108.0_f32).max(80.0_f32)
-                };
+                let bottom_reserve = if is_searching { 325.0_f32 } else { 140.0_f32 };
+                let viewport_h = (ui.available_height() - bottom_reserve).max(80.0_f32);
 
                 if let Some(active_tab) = self.tabs.get_mut(self.active_tab) {
-                    ScrollArea::vertical()
-                        .max_height(available_height)
-                        .auto_shrink([false, false])
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(&active_tab.terminal_output)
-                                        .font(FontId::monospace(15.0))
-                                        .strong()
-                                        .color(fg_color),
-                                )
-                                .wrap_mode(egui::TextWrapMode::Wrap),
-                            );
-                        });
+                    render_brutal_card(
+                        ui,
+                        viewport_h,
+                        bg_color,
+                        border_color,
+                        shadow_color,
+                        4.0,
+                        |ui| {
+                            ScrollArea::vertical()
+                                .max_height(viewport_h - 14.0)
+                                .auto_shrink([false, false])
+                                .stick_to_bottom(true)
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&active_tab.terminal_output)
+                                                .font(FontId::monospace(14.5))
+                                                .strong()
+                                                .color(fg_color),
+                                        )
+                                        .wrap_mode(egui::TextWrapMode::Wrap),
+                                    );
+                                });
+                        },
+                    );
                 }
 
                 if let Some(active_tab) = self.tabs.get_mut(self.active_tab) {
                     if active_tab.search_active {
-                        ui.add_space(8.0);
-                        // 4px Divider above Search Dock
-                        let (rect_div_search, _) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), 4.0),
-                            egui::Sense::hover(),
-                        );
-                        ui.painter()
-                            .rect_filled(rect_div_search, Rounding::ZERO, border_color);
-                        ui.add_space(8.0);
+                        render_brutal_divider(ui, border_color);
 
                         let matches = active_tab.get_search_matches();
                         let total_matches = matches.len();
@@ -1229,41 +1443,66 @@ impl eframe::App for NeoTerminalApp {
                             0
                         };
 
-                        egui::Frame::none()
-                            .fill(bg_color)
-                            .stroke(Stroke::new(4.0_f32, border_color))
-                            .inner_margin(Margin::symmetric(10.0, 8.0))
-                            .show(ui, |ui| {
+                        render_brutal_card(
+                            ui,
+                            165.0,
+                            bg_color,
+                            border_color,
+                            if self.dark_mode { ACCENT_PINK } else { border_color },
+                            5.0,
+                            |ui| {
                                 ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new("REVERSE-i-SEARCH >")
-                                            .font(FontId::monospace(14.0))
-                                            .strong()
-                                            .color(fg_color),
+                                    render_brutal_badge(
+                                        ui,
+                                        "REVERSE-i-SEARCH >",
+                                        ACCENT_PINK,
+                                        PITCH_BLACK,
+                                        border_color,
+                                        shadow_color,
+                                        2.0,
+                                        13.0,
                                     );
+                                    ui.add_space(4.0);
+
                                     let query_display = format!("{}█", active_tab.search_query);
                                     ui.label(
                                         RichText::new(query_display)
                                             .font(FontId::monospace(14.0))
                                             .strong()
-                                            .color(fg_color),
+                                            .color(if active_tab.search_query.is_empty() {
+                                                ACCENT_YELLOW
+                                            } else {
+                                                fg_color
+                                            }),
                                     );
 
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        let count_label = if total_matches > 0 {
-                                            format!(
-                                                "[ MATCH {:02}/{:02} ]",
-                                                sel_idx + 1,
-                                                total_matches
+                                        let (count_label, count_bg, count_fg) = if total_matches > 0 {
+                                            (
+                                                format!(
+                                                    "[ MATCH {:02}/{:02} ]",
+                                                    sel_idx + 1,
+                                                    total_matches
+                                                ),
+                                                ACCENT_YELLOW,
+                                                PITCH_BLACK,
                                             )
                                         } else {
-                                            "[ NO MATCHES ]".to_string()
+                                            (
+                                                "[ NO MATCHES ]".to_string(),
+                                                ACCENT_ORANGE,
+                                                PITCH_BLACK,
+                                            )
                                         };
-                                        ui.label(
-                                            RichText::new(count_label)
-                                                .font(FontId::monospace(12.0))
-                                                .strong()
-                                                .color(fg_color),
+                                        render_brutal_badge(
+                                            ui,
+                                            &count_label,
+                                            count_bg,
+                                            count_fg,
+                                            border_color,
+                                            shadow_color,
+                                            2.0,
+                                            11.5,
                                         );
                                     });
                                 });
@@ -1271,47 +1510,45 @@ impl eframe::App for NeoTerminalApp {
                                 if !matches.is_empty() {
                                     ui.add_space(6.0);
                                     let mut clicked_idx: Option<usize> = None;
-                                    for (m_idx, match_item) in matches.iter().enumerate() {
-                                        let is_selected = m_idx == sel_idx;
-                                        let (row_bg, row_fg) = if is_selected {
-                                            if self.dark_mode {
-                                                (Color32::WHITE, Color32::BLACK)
+                                    ScrollArea::vertical().max_height(105.0).show(ui, |ui| {
+                                        for (m_idx, match_item) in matches.iter().enumerate() {
+                                            let is_selected = m_idx == sel_idx;
+                                            let (row_bg, row_fg) = if is_selected {
+                                                (ACCENT_YELLOW, PITCH_BLACK)
                                             } else {
-                                                (Color32::BLACK, Color32::WHITE)
-                                            }
-                                        } else {
-                                            (bg_color, fg_color)
-                                        };
+                                                (bg_color, fg_color)
+                                            };
 
-                                        let prefix = if is_selected { "> " } else { "  " };
-                                        let row_text =
-                                            format!("{}{:02}: {}", prefix, m_idx + 1, match_item);
+                                            let prefix = if is_selected { "> " } else { "  " };
+                                            let row_text =
+                                                format!("{}{:02}: {}", prefix, m_idx + 1, match_item);
 
-                                        let row_frame = egui::Frame::none()
-                                            .fill(row_bg)
-                                            .stroke(if is_selected {
-                                                Stroke::new(2.0_f32, border_color)
-                                            } else {
-                                                Stroke::NONE
-                                            })
-                                            .rounding(Rounding::ZERO)
-                                            .inner_margin(Margin::symmetric(6.0, 3.0));
-
-                                        row_frame.show(ui, |ui| {
-                                            let resp = ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(row_text)
-                                                        .font(FontId::monospace(13.0))
-                                                        .strong()
-                                                        .color(row_fg),
-                                                )
-                                                .sense(egui::Sense::click()),
-                                            );
-                                            if resp.clicked() {
-                                                clicked_idx = Some(m_idx);
-                                            }
-                                        });
-                                    }
+                                            egui::Frame::none()
+                                                .fill(row_bg)
+                                                .stroke(if is_selected {
+                                                    Stroke::new(3.0_f32, border_color)
+                                                } else {
+                                                    Stroke::NONE
+                                                })
+                                                .rounding(Rounding::ZERO)
+                                                .inner_margin(Margin::symmetric(8.0, 3.5))
+                                                .show(ui, |ui| {
+                                                    let resp = ui.add(
+                                                        egui::Label::new(
+                                                            RichText::new(row_text)
+                                                                .font(FontId::monospace(12.5))
+                                                                .strong()
+                                                                .color(row_fg),
+                                                        )
+                                                        .sense(egui::Sense::click()),
+                                                    );
+                                                    if resp.clicked() {
+                                                        clicked_idx = Some(m_idx);
+                                                    }
+                                                });
+                                            ui.add_space(2.0);
+                                        }
+                                    });
 
                                     if let Some(c_idx) = clicked_idx {
                                         active_tab.input_text = matches[c_idx].clone();
@@ -1320,34 +1557,35 @@ impl eframe::App for NeoTerminalApp {
                                         active_tab.search_active = false;
                                     }
                                 }
-                            });
+                            },
+                        );
                     }
                 }
 
-                ui.add_space(8.0);
-                // 4px Neo-Brutalist Divider above Input Field
-                let (rect_div2, _) = ui.allocate_exact_size(
-                    Vec2::new(ui.available_width(), 4.0),
-                    egui::Sense::hover(),
-                );
-                ui.painter()
-                    .rect_filled(rect_div2, Rounding::ZERO, border_color);
-                ui.add_space(8.0);
+                render_brutal_divider(ui, border_color);
 
                 if let Some(active_tab) = self.tabs.get_mut(self.active_tab) {
-                    // Input Field with Solid Block Cursor █ Matching Theme Text Color
-                    egui::Frame::none()
-                        .fill(bg_color)
-                        .stroke(Stroke::new(4.0_f32, border_color))
-                        .inner_margin(Margin::symmetric(10.0, 8.0))
-                        .show(ui, |ui| {
+                    // Command Dock with Gumroad Yellow Prompt Badge and Electric Pink Cursor
+                    render_brutal_card(
+                        ui,
+                        46.0,
+                        bg_color,
+                        border_color,
+                        shadow_color,
+                        4.0,
+                        |ui| {
                             ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new("PS >")
-                                        .font(FontId::monospace(15.5))
-                                        .strong()
-                                        .color(fg_color),
+                                render_brutal_badge(
+                                    ui,
+                                    "PS >",
+                                    ACCENT_YELLOW,
+                                    PITCH_BLACK,
+                                    border_color,
+                                    shadow_color,
+                                    2.0,
+                                    14.0,
                                 );
+                                ui.add_space(6.0);
 
                                 let byte_pos = active_tab
                                     .input_text
@@ -1359,68 +1597,78 @@ impl eframe::App for NeoTerminalApp {
                                 let before = &active_tab.input_text[..byte_pos];
                                 let after = &active_tab.input_text[byte_pos..];
 
-                                // Solid block cursor █ in current theme's text color
-                                let input_line = format!("{before}█{after}");
-
                                 ui.label(
-                                    RichText::new(input_line)
-                                        .font(FontId::monospace(15.5))
+                                    RichText::new(before)
+                                        .font(FontId::monospace(15.0))
+                                        .strong()
+                                        .color(fg_color),
+                                );
+                                ui.label(
+                                    RichText::new("█")
+                                        .font(FontId::monospace(15.0))
+                                        .strong()
+                                        .color(ACCENT_PINK),
+                                );
+                                ui.label(
+                                    RichText::new(after)
+                                        .font(FontId::monospace(15.0))
                                         .strong()
                                         .color(fg_color),
                                 );
                             });
-                        });
+                        },
+                    );
                 }
 
-                ui.add_space(8.0);
-                // 4px Neo-Brutalist Divider above Bottom Status Strip
-                let (rect_div3, _) = ui.allocate_exact_size(
-                    Vec2::new(ui.available_width(), 4.0),
-                    egui::Sense::hover(),
-                );
-                ui.painter()
-                    .rect_filled(rect_div3, Rounding::ZERO, border_color);
-                ui.add_space(8.0);
+                render_brutal_divider(ui, border_color);
 
-                // Bottom Status Strip (System & Git Telemetry)
+                // Bottom Status Strip (System & Git Telemetry Cards matching neoshaurya.com)
                 ui.horizontal(|ui| {
-                    // 1. Directory Badge
+                    // 1. Directory Badge (Yellow)
                     let dir_name = get_current_dir_name();
-                    render_status_badge(
+                    render_brutal_badge(
                         ui,
                         &format!("DIR: {dir_name}"),
-                        false,
-                        bg_color,
-                        fg_color,
+                        ACCENT_YELLOW,
+                        PITCH_BLACK,
                         border_color,
-                        self.dark_mode,
+                        shadow_color,
+                        3.0,
+                        12.0,
                     );
                     ui.add_space(4.0);
 
-                    // 2. Git Branch Badge
+                    // 2. Git Branch Badge (Pink)
                     if let Some(branch) = get_git_branch_info() {
-                        render_status_badge(
+                        render_brutal_badge(
                             ui,
                             &format!("GIT: {branch}"),
-                            true,
-                            bg_color,
-                            fg_color,
+                            ACCENT_PINK,
+                            PITCH_BLACK,
                             border_color,
-                            self.dark_mode,
+                            shadow_color,
+                            3.0,
+                            12.0,
                         );
                         ui.add_space(4.0);
                     }
 
-                    // 3. System Memory Badge
+                    // 3. System Memory Badge (Dynamic Warning if >80%)
                     if let Some((load, used_gb, total_gb)) = get_system_memory_info() {
-                        render_status_badge(
+                        let (ram_bg, ram_fg) = if load > 80 {
+                            (ACCENT_ORANGE, PITCH_BLACK)
+                        } else {
+                            (bg_color, fg_color)
+                        };
+                        render_brutal_badge(
                             ui,
                             &format!("RAM: {used_gb:.1}G/{total_gb:.0}G ({load}%)"),
-                            false,
-                            bg_color,
-                            fg_color,
+                            ram_bg,
+                            ram_fg,
                             border_color,
-                            self.dark_mode,
+                            shadow_color,
+                            3.0,
+                            12.0,
                         );
                         ui.add_space(4.0);
                     }
@@ -1428,36 +1676,38 @@ impl eframe::App for NeoTerminalApp {
                     // 4. Tab Status Badge
                     let total_tabs = self.tabs.len();
                     let current_tab_num = self.active_tab + 1;
-                    render_status_badge(
+                    render_brutal_badge(
                         ui,
                         &format!("TAB: {current_tab_num}/{total_tabs}"),
-                        false,
                         bg_color,
                         fg_color,
                         border_color,
-                        self.dark_mode,
+                        shadow_color,
+                        3.0,
+                        12.0,
                     );
                     ui.add_space(4.0);
 
-                    // 5. Active Tab Execution State Badge
+                    // 5. Active Tab Execution State Badge (Teal IDLE / Orange BUSY)
                     let is_busy = self
                         .tabs
                         .get(self.active_tab)
                         .map(|t| t.last_activity.elapsed() < Duration::from_millis(800))
                         .unwrap_or(false);
-                    let (state_label, state_invert) = if is_busy {
-                        ("STATE: BUSY ●", true)
+                    let (state_label, state_bg) = if is_busy {
+                        ("STATE: BUSY ●", ACCENT_ORANGE)
                     } else {
-                        ("STATE: IDLE", false)
+                        ("STATE: IDLE", ACCENT_TEAL)
                     };
-                    render_status_badge(
+                    render_brutal_badge(
                         ui,
                         state_label,
-                        state_invert,
-                        bg_color,
-                        fg_color,
+                        state_bg,
+                        PITCH_BLACK,
                         border_color,
-                        self.dark_mode,
+                        shadow_color,
+                        3.0,
+                        12.0,
                     );
                     ui.add_space(4.0);
 
@@ -1465,31 +1715,33 @@ impl eframe::App for NeoTerminalApp {
                     let up_secs = self.start_time.elapsed().as_secs();
                     let up_mins = up_secs / 60;
                     let up_rem_secs = up_secs % 60;
-                    render_status_badge(
+                    render_brutal_badge(
                         ui,
                         &format!("UP: {up_mins}m {up_rem_secs:02}s"),
-                        false,
                         bg_color,
                         fg_color,
                         border_color,
-                        self.dark_mode,
+                        shadow_color,
+                        3.0,
+                        12.0,
                     );
 
                     // Right-aligned hotkey pill
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let (hint_text, hint_invert) = if is_searching {
-                            ("ESC: CANCEL // ENTER: SELECT", true)
+                        let (hint_text, hint_bg, hint_fg) = if is_searching {
+                            ("ESC: CANCEL // ENTER: SELECT", ACCENT_PINK, PITCH_BLACK)
                         } else {
-                            ("CTRL+R: SEARCH // WIN+Q // CTRL+ALT+T", false)
+                            ("CTRL+R: SEARCH // WIN+Q // CTRL+T", bg_color, fg_color)
                         };
-                        render_status_badge(
+                        render_brutal_badge(
                             ui,
                             hint_text,
-                            hint_invert,
-                            bg_color,
-                            fg_color,
+                            hint_bg,
+                            hint_fg,
                             border_color,
-                            self.dark_mode,
+                            shadow_color,
+                            3.0,
+                            11.5,
                         );
                     });
                 });
