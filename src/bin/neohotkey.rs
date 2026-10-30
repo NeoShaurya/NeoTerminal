@@ -121,7 +121,9 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: usize, lparam: isize) -> 
 
         // When any trigger or modifier key is released, reset the latch
         if is_key_up {
-            if kbd.vk_code == VK_T || kbd.vk_code == VK_Q || !ctrl_down || !alt_down || !win_down {
+            if kbd.vk_code == VK_T || kbd.vk_code == VK_Q {
+                KEY_ACTIVE = false;
+            } else if (!ctrl_down || !alt_down) && !win_down {
                 KEY_ACTIVE = false;
             }
         }
