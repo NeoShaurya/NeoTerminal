@@ -78,6 +78,104 @@ fn get_current_dir_name() -> String {
     "~".to_string()
 }
 
+/// Fuzzy match score between a search pattern and a candidate string
+pub fn fuzzy_match(pattern: &str, candidate: &str) -> Option<i32> {
+    if pattern.is_empty() {
+        return Some(0);
+    }
+    let p_lower = pattern.to_lowercase();
+    let c_lower = candidate.to_lowercase();
+
+    // Exact match
+    if p_lower == c_lower {
+        return Some(10000);
+    }
+
+    // Exact substring match
+    if let Some(pos) = c_lower.find(&p_lower) {
+        let prefix_bonus = if pos == 0 { 2000 } else { 1000 };
+        let score = prefix_bonus - (pos as i32) * 20 - (candidate.len() as i32);
+        return Some(score);
+    }
+
+    // Subsequence match: all chars of pattern appear in order
+    let mut p_chars = p_lower.chars().peekable();
+    let mut score = 100;
+    let mut consecutive = 0;
+    let mut prev_matched = false;
+
+    for ch in c_lower.chars() {
+        if let Some(&p) = p_chars.peek() {
+            if ch == p {
+                p_chars.next();
+                score += 15 + (if prev_matched { consecutive * 10 } else { 0 });
+                consecutive += 1;
+                prev_matched = true;
+            } else {
+                prev_matched = false;
+                consecutive = 0;
+            }
+        }
+    }
+
+    if p_chars.peek().is_none() {
+        Some(score - (candidate.len() as i32))
+    } else {
+        None
+    }
+}
+
+/// Load persistent command history from PSReadLine history file if present
+fn load_persistent_history() -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let path = std::path::PathBuf::from(appdata)
+                .join("Microsoft")
+                .join("Windows")
+                .join("PowerShell")
+                .join("PSReadLine")
+                .join("ConsoleHost_history.txt");
+            if let Ok(content) = std::fs::read_to_string(path) {
+                let mut history = Vec::new();
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        if history.last().map(|s: &String| s.as_str()) != Some(trimmed) {
+                            history.push(trimmed.to_string());
+                        }
+                    }
+                }
+                return history;
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Append newly executed command to PSReadLine persistent history
+fn append_persistent_history(cmd: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        let trimmed = cmd.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let dir = std::path::PathBuf::from(appdata)
+                .join("Microsoft")
+                .join("Windows")
+                .join("PowerShell")
+                .join("PSReadLine");
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("ConsoleHost_history.txt");
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(file, "{}", trimmed);
+            }
+        }
+    }
+}
+
 fn render_status_badge(
     ui: &mut egui::Ui,
     label: &str,
@@ -285,6 +383,9 @@ struct TerminalTab {
     history: Vec<String>,
     history_idx: Option<usize>,
     has_unread: bool,
+    search_active: bool,
+    search_query: String,
+    search_selected_idx: usize,
     last_activity: Instant,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     rx: Receiver<String>,
@@ -385,6 +486,8 @@ impl TerminalTab {
             }
         });
 
+        let history = load_persistent_history();
+
         Ok(Self {
             _id: id,
             title,
@@ -392,15 +495,45 @@ impl TerminalTab {
             ansi_leftover: String::new(),
             input_text: String::new(),
             cursor_pos: 0,
-            history: Vec::new(),
+            history,
             history_idx: None,
             has_unread: false,
+            search_active: false,
+            search_query: String::new(),
+            search_selected_idx: 0,
             last_activity: Instant::now(),
             writer,
             rx,
             _master: pair.master,
             _child: child,
         })
+    }
+
+    fn get_search_matches(&self) -> Vec<String> {
+        let query = self.search_query.trim();
+        let mut candidates: Vec<String> = Vec::new();
+
+        for cmd in self.history.iter().rev() {
+            let trimmed = cmd.trim();
+            if !trimmed.is_empty() && !candidates.iter().any(|c| c == trimmed) {
+                candidates.push(trimmed.to_string());
+            }
+        }
+
+        if query.is_empty() {
+            candidates.truncate(5);
+            return candidates;
+        }
+
+        let mut scored: Vec<(i32, String)> = Vec::new();
+        for cmd in candidates {
+            if let Some(score) = fuzzy_match(query, &cmd) {
+                scored.push((score, cmd));
+            }
+        }
+
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.into_iter().take(5).map(|(_, s)| s).collect()
     }
 
     fn submit_command(&mut self, ctx: &egui::Context) {
@@ -419,8 +552,11 @@ impl TerminalTab {
             return;
         }
 
-        // Store into command history
-        self.history.push(cmd.clone());
+        // Store into command history and persistent file
+        if self.history.last().map(|s| s.as_str()) != Some(&cmd) {
+            self.history.push(cmd.clone());
+        }
+        append_persistent_history(&cmd);
 
         // Custom tab rename command: 'title <name>' or 'rename <name>'
         let lower = trimmed.to_lowercase();
@@ -646,16 +782,25 @@ impl eframe::App for NeoTerminalApp {
             for event in &i.events {
                 match event {
                     egui::Event::Text(text) => {
-                        for ch in text.chars() {
-                            if !ch.is_control() {
-                                let byte_pos = tab
-                                    .input_text
-                                    .char_indices()
-                                    .nth(tab.cursor_pos)
-                                    .map(|(idx, _)| idx)
-                                    .unwrap_or(tab.input_text.len());
-                                tab.input_text.insert(byte_pos, ch);
-                                tab.cursor_pos += 1;
+                        if tab.search_active {
+                            for ch in text.chars() {
+                                if !ch.is_control() {
+                                    tab.search_query.push(ch);
+                                    tab.search_selected_idx = 0;
+                                }
+                            }
+                        } else {
+                            for ch in text.chars() {
+                                if !ch.is_control() {
+                                    let byte_pos = tab
+                                        .input_text
+                                        .char_indices()
+                                        .nth(tab.cursor_pos)
+                                        .map(|(idx, _)| idx)
+                                        .unwrap_or(tab.input_text.len());
+                                    tab.input_text.insert(byte_pos, ch);
+                                    tab.cursor_pos += 1;
+                                }
                             }
                         }
                     }
@@ -664,124 +809,182 @@ impl eframe::App for NeoTerminalApp {
                             .replace("\r\n", " ")
                             .replace('\n', " ")
                             .replace('\r', " ");
-                        let byte_pos = tab
-                            .input_text
-                            .char_indices()
-                            .nth(tab.cursor_pos)
-                            .map(|(idx, _)| idx)
-                            .unwrap_or(tab.input_text.len());
-                        tab.input_text.insert_str(byte_pos, &filtered);
-                        tab.cursor_pos += filtered.chars().count();
+                        if tab.search_active {
+                            tab.search_query.push_str(&filtered);
+                            tab.search_selected_idx = 0;
+                        } else {
+                            let byte_pos = tab
+                                .input_text
+                                .char_indices()
+                                .nth(tab.cursor_pos)
+                                .map(|(idx, _)| idx)
+                                .unwrap_or(tab.input_text.len());
+                            tab.input_text.insert_str(byte_pos, &filtered);
+                            tab.cursor_pos += filtered.chars().count();
+                        }
                     }
                     egui::Event::Key {
                         key,
                         pressed: true,
                         modifiers,
                         ..
-                    } => match key {
-                        Key::Enter => {
-                            tab.submit_command(ctx);
-                        }
-                        Key::Backspace => {
-                            if tab.cursor_pos > 0 && !tab.input_text.is_empty() {
-                                tab.cursor_pos -= 1;
-                                let byte_pos = tab
-                                    .input_text
-                                    .char_indices()
-                                    .nth(tab.cursor_pos)
-                                    .map(|(idx, _)| idx)
-                                    .unwrap_or(0);
-                                tab.input_text.remove(byte_pos);
+                    } => {
+                        if tab.search_active {
+                            match key {
+                                Key::Escape => {
+                                    tab.search_active = false;
+                                }
+                                Key::C if modifiers.ctrl => {
+                                    tab.search_active = false;
+                                }
+                                Key::R if modifiers.ctrl => {
+                                    let matches = tab.get_search_matches();
+                                    if !matches.is_empty() {
+                                        tab.search_selected_idx =
+                                            (tab.search_selected_idx + 1) % matches.len();
+                                    }
+                                }
+                                Key::Enter | Key::Tab => {
+                                    let matches = tab.get_search_matches();
+                                    if !matches.is_empty() {
+                                        let sel =
+                                            tab.search_selected_idx.min(matches.len() - 1);
+                                        tab.input_text = matches[sel].clone();
+                                        tab.cursor_pos = tab.input_text.chars().count();
+                                    }
+                                    tab.search_active = false;
+                                }
+                                Key::Backspace => {
+                                    tab.search_query.pop();
+                                    tab.search_selected_idx = 0;
+                                }
+                                Key::ArrowUp => {
+                                    if tab.search_selected_idx > 0 {
+                                        tab.search_selected_idx -= 1;
+                                    }
+                                }
+                                Key::ArrowDown => {
+                                    let matches = tab.get_search_matches();
+                                    if !matches.is_empty()
+                                        && tab.search_selected_idx + 1 < matches.len()
+                                    {
+                                        tab.search_selected_idx += 1;
+                                    }
+                                }
+                                _ => {}
                             }
-                        }
-                        Key::Delete => {
-                            if tab.cursor_pos < tab.input_text.chars().count() {
-                                let byte_pos = tab
-                                    .input_text
-                                    .char_indices()
-                                    .nth(tab.cursor_pos)
-                                    .map(|(idx, _)| idx)
-                                    .unwrap_or(tab.input_text.len());
-                                tab.input_text.remove(byte_pos);
-                            }
-                        }
-                        Key::ArrowLeft => {
-                            if tab.cursor_pos > 0 {
-                                tab.cursor_pos -= 1;
-                            }
-                        }
-                        Key::ArrowRight => {
-                            if tab.cursor_pos < tab.input_text.chars().count() {
-                                tab.cursor_pos += 1;
-                            }
-                        }
-                        Key::Home => {
-                            tab.cursor_pos = 0;
-                        }
-                        Key::End => {
-                            tab.cursor_pos = tab.input_text.chars().count();
-                        }
-                        Key::ArrowUp => {
-                            if !tab.history.is_empty() {
-                                let next_idx = match tab.history_idx {
-                                    None => tab.history.len() - 1,
-                                    Some(idx) if idx > 0 => idx - 1,
-                                    Some(idx) => idx,
-                                };
-                                tab.history_idx = Some(next_idx);
-                                tab.input_text = tab.history[next_idx].clone();
-                                tab.cursor_pos = tab.input_text.chars().count();
-                            }
-                        }
-                        Key::ArrowDown => {
-                            if let Some(idx) = tab.history_idx {
-                                if idx + 1 < tab.history.len() {
-                                    tab.history_idx = Some(idx + 1);
-                                    tab.input_text = tab.history[idx + 1].clone();
-                                    tab.cursor_pos = tab.input_text.chars().count();
-                                } else {
-                                    tab.history_idx = None;
-                                    tab.input_text.clear();
+                        } else {
+                            match key {
+                                Key::R if modifiers.ctrl => {
+                                    tab.search_active = true;
+                                    tab.search_query.clear();
+                                    tab.search_selected_idx = 0;
+                                }
+                                Key::Enter => {
+                                    tab.submit_command(ctx);
+                                }
+                                Key::Backspace => {
+                                    if tab.cursor_pos > 0 && !tab.input_text.is_empty() {
+                                        tab.cursor_pos -= 1;
+                                        let byte_pos = tab
+                                            .input_text
+                                            .char_indices()
+                                            .nth(tab.cursor_pos)
+                                            .map(|(idx, _)| idx)
+                                            .unwrap_or(0);
+                                        tab.input_text.remove(byte_pos);
+                                    }
+                                }
+                                Key::Delete => {
+                                    if tab.cursor_pos < tab.input_text.chars().count() {
+                                        let byte_pos = tab
+                                            .input_text
+                                            .char_indices()
+                                            .nth(tab.cursor_pos)
+                                            .map(|(idx, _)| idx)
+                                            .unwrap_or(tab.input_text.len());
+                                        tab.input_text.remove(byte_pos);
+                                    }
+                                }
+                                Key::ArrowLeft => {
+                                    if tab.cursor_pos > 0 {
+                                        tab.cursor_pos -= 1;
+                                    }
+                                }
+                                Key::ArrowRight => {
+                                    if tab.cursor_pos < tab.input_text.chars().count() {
+                                        tab.cursor_pos += 1;
+                                    }
+                                }
+                                Key::Home => {
                                     tab.cursor_pos = 0;
                                 }
+                                Key::End => {
+                                    tab.cursor_pos = tab.input_text.chars().count();
+                                }
+                                Key::ArrowUp => {
+                                    if !tab.history.is_empty() {
+                                        let next_idx = match tab.history_idx {
+                                            None => tab.history.len() - 1,
+                                            Some(idx) if idx > 0 => idx - 1,
+                                            Some(idx) => idx,
+                                        };
+                                        tab.history_idx = Some(next_idx);
+                                        tab.input_text = tab.history[next_idx].clone();
+                                        tab.cursor_pos = tab.input_text.chars().count();
+                                    }
+                                }
+                                Key::ArrowDown => {
+                                    if let Some(idx) = tab.history_idx {
+                                        if idx + 1 < tab.history.len() {
+                                            tab.history_idx = Some(idx + 1);
+                                            tab.input_text = tab.history[idx + 1].clone();
+                                            tab.cursor_pos = tab.input_text.chars().count();
+                                        } else {
+                                            tab.history_idx = None;
+                                            tab.input_text.clear();
+                                            tab.cursor_pos = 0;
+                                        }
+                                    }
+                                }
+                                Key::C if modifiers.ctrl => {
+                                    tab.terminal_output
+                                        .push_str(&format!("PS > {}^C\n", tab.input_text));
+                                    tab.input_text.clear();
+                                    tab.cursor_pos = 0;
+                                    if let Ok(mut w) = tab.writer.lock() {
+                                        let _ = w.write_all(b"\x03");
+                                        let _ = w.flush();
+                                    }
+                                }
+                                Key::L if modifiers.ctrl => {
+                                    tab.terminal_output.clear();
+                                }
+                                Key::T if modifiers.ctrl => {
+                                    action_new_tab = true;
+                                }
+                                Key::W if modifiers.ctrl => {
+                                    action_close_tab = true;
+                                }
+                                Key::Tab if modifiers.ctrl => {
+                                    if modifiers.shift {
+                                        action_prev_tab = true;
+                                    } else {
+                                        action_next_tab = true;
+                                    }
+                                }
+                                Key::Num1 if modifiers.ctrl => { action_select_tab = Some(0); }
+                                Key::Num2 if modifiers.ctrl => { action_select_tab = Some(1); }
+                                Key::Num3 if modifiers.ctrl => { action_select_tab = Some(2); }
+                                Key::Num4 if modifiers.ctrl => { action_select_tab = Some(3); }
+                                Key::Num5 if modifiers.ctrl => { action_select_tab = Some(4); }
+                                Key::Num6 if modifiers.ctrl => { action_select_tab = Some(5); }
+                                Key::Num7 if modifiers.ctrl => { action_select_tab = Some(6); }
+                                Key::Num8 if modifiers.ctrl => { action_select_tab = Some(7); }
+                                Key::Num9 if modifiers.ctrl => { action_select_tab = Some(8); }
+                                _ => {}
                             }
                         }
-                        Key::C if modifiers.ctrl => {
-                            tab.terminal_output
-                                .push_str(&format!("PS > {}^C\n", tab.input_text));
-                            tab.input_text.clear();
-                            tab.cursor_pos = 0;
-                            if let Ok(mut w) = tab.writer.lock() {
-                                let _ = w.write_all(b"\x03");
-                                let _ = w.flush();
-                            }
-                        }
-                        Key::L if modifiers.ctrl => {
-                            tab.terminal_output.clear();
-                        }
-                        Key::T if modifiers.ctrl => {
-                            action_new_tab = true;
-                        }
-                        Key::W if modifiers.ctrl => {
-                            action_close_tab = true;
-                        }
-                        Key::Tab if modifiers.ctrl => {
-                            if modifiers.shift {
-                                action_prev_tab = true;
-                            } else {
-                                action_next_tab = true;
-                            }
-                        }
-                        Key::Num1 if modifiers.ctrl => { action_select_tab = Some(0); }
-                        Key::Num2 if modifiers.ctrl => { action_select_tab = Some(1); }
-                        Key::Num3 if modifiers.ctrl => { action_select_tab = Some(2); }
-                        Key::Num4 if modifiers.ctrl => { action_select_tab = Some(3); }
-                        Key::Num5 if modifiers.ctrl => { action_select_tab = Some(4); }
-                        Key::Num6 if modifiers.ctrl => { action_select_tab = Some(5); }
-                        Key::Num7 if modifiers.ctrl => { action_select_tab = Some(6); }
-                        Key::Num8 if modifiers.ctrl => { action_select_tab = Some(7); }
-                        Key::Num9 if modifiers.ctrl => { action_select_tab = Some(8); }
-                        _ => {}
                     },
                     _ => {}
                 }
@@ -978,7 +1181,15 @@ impl eframe::App for NeoTerminalApp {
                 ui.add_space(8.0);
 
                 // Scrolling Terminal Output Area
-                let available_height = (ui.available_height() - 108.0_f32).max(80.0_f32);
+                let is_searching = self
+                    .tabs
+                    .get(self.active_tab)
+                    .map_or(false, |t| t.search_active);
+                let available_height = if is_searching {
+                    (ui.available_height() - 290.0_f32).max(60.0_f32)
+                } else {
+                    (ui.available_height() - 108.0_f32).max(80.0_f32)
+                };
 
                 if let Some(active_tab) = self.tabs.get_mut(self.active_tab) {
                     ScrollArea::vertical()
@@ -996,6 +1207,121 @@ impl eframe::App for NeoTerminalApp {
                                 .wrap_mode(egui::TextWrapMode::Wrap),
                             );
                         });
+                }
+
+                if let Some(active_tab) = self.tabs.get_mut(self.active_tab) {
+                    if active_tab.search_active {
+                        ui.add_space(8.0);
+                        // 4px Divider above Search Dock
+                        let (rect_div_search, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 4.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter()
+                            .rect_filled(rect_div_search, Rounding::ZERO, border_color);
+                        ui.add_space(8.0);
+
+                        let matches = active_tab.get_search_matches();
+                        let total_matches = matches.len();
+                        let sel_idx = if total_matches > 0 {
+                            active_tab.search_selected_idx.min(total_matches - 1)
+                        } else {
+                            0
+                        };
+
+                        egui::Frame::none()
+                            .fill(bg_color)
+                            .stroke(Stroke::new(4.0_f32, border_color))
+                            .inner_margin(Margin::symmetric(10.0, 8.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new("REVERSE-i-SEARCH >")
+                                            .font(FontId::monospace(14.0))
+                                            .strong()
+                                            .color(fg_color),
+                                    );
+                                    let query_display = format!("{}█", active_tab.search_query);
+                                    ui.label(
+                                        RichText::new(query_display)
+                                            .font(FontId::monospace(14.0))
+                                            .strong()
+                                            .color(fg_color),
+                                    );
+
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        let count_label = if total_matches > 0 {
+                                            format!(
+                                                "[ MATCH {:02}/{:02} ]",
+                                                sel_idx + 1,
+                                                total_matches
+                                            )
+                                        } else {
+                                            "[ NO MATCHES ]".to_string()
+                                        };
+                                        ui.label(
+                                            RichText::new(count_label)
+                                                .font(FontId::monospace(12.0))
+                                                .strong()
+                                                .color(fg_color),
+                                        );
+                                    });
+                                });
+
+                                if !matches.is_empty() {
+                                    ui.add_space(6.0);
+                                    let mut clicked_idx: Option<usize> = None;
+                                    for (m_idx, match_item) in matches.iter().enumerate() {
+                                        let is_selected = m_idx == sel_idx;
+                                        let (row_bg, row_fg) = if is_selected {
+                                            if self.dark_mode {
+                                                (Color32::WHITE, Color32::BLACK)
+                                            } else {
+                                                (Color32::BLACK, Color32::WHITE)
+                                            }
+                                        } else {
+                                            (bg_color, fg_color)
+                                        };
+
+                                        let prefix = if is_selected { "> " } else { "  " };
+                                        let row_text =
+                                            format!("{}{:02}: {}", prefix, m_idx + 1, match_item);
+
+                                        let row_frame = egui::Frame::none()
+                                            .fill(row_bg)
+                                            .stroke(if is_selected {
+                                                Stroke::new(2.0_f32, border_color)
+                                            } else {
+                                                Stroke::NONE
+                                            })
+                                            .rounding(Rounding::ZERO)
+                                            .inner_margin(Margin::symmetric(6.0, 3.0));
+
+                                        row_frame.show(ui, |ui| {
+                                            let resp = ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(row_text)
+                                                        .font(FontId::monospace(13.0))
+                                                        .strong()
+                                                        .color(row_fg),
+                                                )
+                                                .sense(egui::Sense::click()),
+                                            );
+                                            if resp.clicked() {
+                                                clicked_idx = Some(m_idx);
+                                            }
+                                        });
+                                    }
+
+                                    if let Some(c_idx) = clicked_idx {
+                                        active_tab.input_text = matches[c_idx].clone();
+                                        active_tab.cursor_pos =
+                                            active_tab.input_text.chars().count();
+                                        active_tab.search_active = false;
+                                    }
+                                }
+                            });
+                    }
                 }
 
                 ui.add_space(8.0);
@@ -1151,10 +1477,15 @@ impl eframe::App for NeoTerminalApp {
 
                     // Right-aligned hotkey pill
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let (hint_text, hint_invert) = if is_searching {
+                            ("ESC: CANCEL // ENTER: SELECT", true)
+                        } else {
+                            ("CTRL+R: SEARCH // WIN+Q // CTRL+ALT+T", false)
+                        };
                         render_status_badge(
                             ui,
-                            "WIN+Q // CTRL+ALT+T",
-                            false,
+                            hint_text,
+                            hint_invert,
                             bg_color,
                             fg_color,
                             border_color,
@@ -1437,6 +1768,56 @@ mod tests {
         if let Some(branch) = get_git_branch_info() {
             assert!(!branch.is_empty(), "Branch name should not be empty");
         }
+    }
+
+    #[test]
+    fn test_fuzzy_match_algorithm() {
+        // Exact match
+        assert_eq!(fuzzy_match("git status", "git status"), Some(10000));
+        assert_eq!(fuzzy_match("GIT STATUS", "git status"), Some(10000));
+
+        // Substring match
+        let score_prefix = fuzzy_match("sync", "sync-projects").expect("should match prefix");
+        let score_mid = fuzzy_match("proj", "sync-projects").expect("should match substring");
+        assert!(score_prefix > score_mid, "Prefix match should score higher");
+
+        // Subsequence match
+        let score_subseq = fuzzy_match("sp", "sync-projects").expect("should match subsequence");
+        assert!(score_subseq > 0);
+
+        // Non-matching
+        assert_eq!(fuzzy_match("xyz", "sync-projects"), None);
+    }
+
+    #[test]
+    fn test_history_search_matches() {
+        let history = vec![
+            "git status".to_string(),
+            "sync-portfolio".to_string(),
+            "cargo build --release".to_string(),
+            "sync-projects".to_string(),
+        ];
+
+        // Empty query returns most recent items
+        let mut candidates = Vec::new();
+        for cmd in history.iter().rev() {
+            candidates.push(cmd.clone());
+        }
+        assert_eq!(candidates[0], "sync-projects");
+
+        // "sync" query matches both sync commands with "sync-projects" ranked first
+        let q = "sync";
+        let mut scored: Vec<(i32, String)> = Vec::new();
+        for cmd in candidates {
+            if let Some(score) = fuzzy_match(q, &cmd) {
+                scored.push((score, cmd));
+            }
+        }
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        let results: Vec<String> = scored.into_iter().map(|(_, s)| s).collect();
+        assert!(results.contains(&"sync-projects".to_string()));
+        assert!(results.contains(&"sync-portfolio".to_string()));
+        assert!(!results.contains(&"git status".to_string()));
     }
 }
 

@@ -55,7 +55,17 @@
   - **`TAB`**: Active and total tab count indicator (e.g. `[ TAB: 1/2 ]`).
   - **`STATE`**: Real-time process execution status (`[ STATE: IDLE ]` vs. high-contrast `[ STATE: BUSY ● ]` when output is streaming).
   - **`UP`**: Terminal session uptime counter (`[ UP: 12m 45s ]`).
-  - Right-aligned quick hotkey hint pill (`[ WIN+Q // CTRL+ALT+T ]`).
+  - Right-aligned quick hotkey hint pill (`[ CTRL+R: SEARCH // WIN+Q // CTRL+ALT+T ]`).
+- **Interactive Fuzzy History Search (`Ctrl + R`)**:
+  - Full reverse-i-search powered by a deterministic fuzzy subsequence and prefix ranking engine.
+  - Reads and auto-syncs persistent Windows PowerShell command history (`ConsoleHost_history.txt`).
+  - Live search dock with 4px brutalist border:
+    - **`Ctrl + R`**: Toggle interactive history search.
+    - **`Type`**: Instant live fuzzy filtering across entire command history.
+    - **`Up` / `Down` Arrow Keys** or repeated **`Ctrl + R`**: Cycle through ranked matches with real-time highlighted selection.
+    - **`Enter` / `Tab`**: Accept match and load directly into prompt for editing or execution.
+    - **`Esc` / `Ctrl + C`**: Cancel search and return to previous input.
+    - **Mouse Interactivity**: Click any match in the results list to load it instantly.
 - **PTY Shell Backend**:
   - Spawns the default system shell (`PowerShell`) via Windows ConPTY using `portable-pty`.
   - Non-blocking background worker thread using `std::sync::mpsc` streaming shell output into the GUI.
